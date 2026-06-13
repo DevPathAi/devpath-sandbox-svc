@@ -16,15 +16,23 @@ java {
 
 repositories {
 	mavenCentral()
+	maven {
+		url = uri("https://maven.pkg.github.com/DevPathAi/devpath-shared")
+		credentials {
+			username = providers.gradleProperty("gpr.user").orElse(providers.environmentVariable("GITHUB_ACTOR")).orNull
+			password = providers.gradleProperty("gpr.token").orElse(providers.environmentVariable("GITHUB_TOKEN")).orNull
+		}
+	}
 }
 
 dependencies {
 	implementation("org.springframework.boot:spring-boot-starter-actuator")
 	implementation("org.springframework.boot:spring-boot-starter-validation")
 	implementation("org.springframework.boot:spring-boot-starter-webmvc")
+	implementation("org.springframework.boot:spring-boot-starter-data-jpa")
+	implementation("ai.devpath:devpath-shared:0.0.1-SNAPSHOT")
+	runtimeOnly("org.postgresql:postgresql")
 	// 서비스 특성에 따라 주석 해제해서 사용한다.
-	// implementation("org.springframework.boot:spring-boot-starter-data-jpa")
-	// runtimeOnly("com.mysql:mysql-connector-j")
 	// implementation("org.springframework.boot:spring-boot-starter-data-redis")
 	// implementation("org.springframework.boot:spring-boot-starter-security")
 	// implementation("org.springframework.kafka:spring-kafka")

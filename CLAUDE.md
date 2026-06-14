@@ -45,3 +45,10 @@
 - 비밀값(Claude API 키·OAuth·결제 키)은 절대 커밋하지 않는다.
 - 진행 현황은 `docs/project-management/`에 기록 → [workflow-dashboard](https://devpathai.github.io/workflow-dashboard/)가 동기화.
 
+
+## 🚫 서브에이전트 작업 범위 강제 (Scope Lock) — 모든 작업 공통
+
+- 서브에이전트(Task/Agent)에 위임 시 **작업 경계를 명시적으로 못박는다**: "이 작업만 수행하고 끝나면 보고 후 정지. 다른 Task로 진행하거나 명세에 없는 코드를 임의 구현 금지. 명세 부족 시 멈추고 NEEDS_CONTEXT 보고."
+- 서브에이전트는 **부여된 단일 Task의 명세만** 구현한다. 추측·즉흥(improvise) 금지.
+- 위임 결과는 **컨트롤러가 직접 검증**한다(커밋 로그·파일 구조·테스트 실행). 완료 보고를 그대로 신뢰하지 않는다.
+- 범위 이탈 산출물은 수용하지 말고, 미푸시면 정상 지점으로 reset 후 플랜대로 재구현한다.

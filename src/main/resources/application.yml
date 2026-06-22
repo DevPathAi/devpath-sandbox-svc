@@ -1,3 +1,9 @@
+devpath:
+  auth:
+    jwt-secret: ${JWT_SECRET:test-secret-please-change-min-32-bytes-long-0123456789}
+  sandbox:
+    sse-timeout-ms: 60000
+
 spring:
   application:
     name: devpath-sandbox-svc
@@ -13,6 +19,14 @@ spring:
       hibernate.dialect: org.hibernate.dialect.PostgreSQLDialect
   flyway:
     enabled: false   # 마이그레이션은 devpath-shared(중앙)에서 실행, 서비스는 validate만
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+    consumer:
+      group-id: devpath-sandbox
+      auto-offset-reset: earliest
 
 server:
   port: 8080

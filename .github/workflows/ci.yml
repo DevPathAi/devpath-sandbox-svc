@@ -13,7 +13,7 @@ jobs:
       packages: read
     services:
       postgres:
-        image: postgres:17-alpine
+        image: pgvector/pgvector:pg17
         env:
           POSTGRES_USER: devpath
           POSTGRES_PASSWORD: localdev

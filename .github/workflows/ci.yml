@@ -32,7 +32,7 @@ jobs:
           distribution: temurin
           java-version: 21
       - uses: gradle/actions/setup-gradle@v6
-      - run: ./gradlew build
+      - run: ./gradlew --refresh-dependencies build
         env:
           DB_URL: jdbc:postgresql://localhost:5432/devpath
           DB_USER: devpath
@@ -54,7 +54,7 @@ jobs:
           distribution: temurin
           java-version: 21
       - uses: gradle/actions/setup-gradle@v6
-      - run: ./gradlew bootJar
+      - run: ./gradlew --refresh-dependencies bootJar
         env:
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

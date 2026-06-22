@@ -6,6 +6,7 @@ import javax.sql.DataSource;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.test.context.ActiveProfiles;
 
 /**
  * PostgreSQL 연결 + 컨텍스트 로드 검증.
@@ -14,6 +15,7 @@ import org.springframework.boot.test.context.SpringBootTest;
  * 마이그레이션은 devpath-shared가 소유하므로 서비스는 ddl-auto: validate로 매핑만 검증한다.
  */
 @SpringBootTest
+@ActiveProfiles("test")
 class DbConnectionTest {
 
   @Autowired DataSource dataSource;

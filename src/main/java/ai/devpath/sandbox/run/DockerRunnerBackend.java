@@ -18,8 +18,10 @@ import com.github.dockerjava.httpclient5.ApacheDockerHttpClient;
 import com.github.dockerjava.transport.DockerHttpClient;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.time.Duration;
 import java.util.Comparator;
 import java.util.List;
@@ -145,15 +147,37 @@ public class DockerRunnerBackend implements RunnerBackend {
 
   private Path createWorkspace(RunSpec spec, Runtime runtime) {
     try {
-      Path workspace = Files.createTempDirectory("devpath-sandbox-" + spec.sandboxSessionId() + "-");
-      Files.writeString(
-          workspace.resolve(runtime.fileName()),
-          spec.code() == null ? "" : spec.code(),
-          StandardCharsets.UTF_8);
-      return workspace;
+      return prepareWorkspace(spec.sandboxSessionId(), runtime.fileName(), spec.code());
     } catch (IOException e) {
       throw new SandboxUnavailableException("Could not prepare sandbox workspace", e);
     }
+  }
+
+  static Path prepareWorkspace(long sandboxSessionId, String fileName, String code)
+      throws IOException {
+    Path workspace = Files.createTempDirectory("devpath-sandbox-" + sandboxSessionId + "-");
+    Path sourceFile = workspace.resolve(fileName);
+    Files.writeString(sourceFile, code == null ? "" : code, StandardCharsets.UTF_8);
+    relaxPermissionsForContainerUser(workspace, sourceFile);
+    return workspace;
+  }
+
+  /**
+   * {@link Files#createTempDirectory} creates the directory with owner-only (0700) permissions.
+   * The sandbox container runs as the unprivileged {@code nobody} user and mounts this workspace
+   * read-only, so on a native Linux host {@code nobody} can neither traverse the directory nor read
+   * the source file, and every execution fails with "Permission denied". Relax the directory to
+   * 0755 and the source file to 0644 so the container user can read its own source. No-op on
+   * non-POSIX hosts (e.g. Windows dev machines, where Docker Desktop already remaps bind-mount
+   * permissions and the owner-only mode is harmless).
+   */
+  private static void relaxPermissionsForContainerUser(Path workspace, Path sourceFile)
+      throws IOException {
+    if (!FileSystems.getDefault().supportedFileAttributeViews().contains("posix")) {
+      return;
+    }
+    Files.setPosixFilePermissions(workspace, PosixFilePermissions.fromString("rwxr-xr-x"));
+    Files.setPosixFilePermissions(sourceFile, PosixFilePermissions.fromString("rw-r--r--"));
   }
 
   private static void appendFrame(

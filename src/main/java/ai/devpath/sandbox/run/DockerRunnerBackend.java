@@ -39,6 +39,18 @@ public class DockerRunnerBackend implements RunnerBackend {
   private static final long PIDS_LIMIT = 128L;
 
   @Override
+  public boolean isAvailable() {
+    try {
+      DockerClient docker = createDockerClient();
+      docker.pingCmd().exec();
+      docker.close();
+      return true;
+    } catch (Exception e) {
+      return false;
+    }
+  }
+
+  @Override
   public RunResult run(RunSpec spec, Consumer<String> logCallback) {
     Runtime runtime = Runtime.fromLanguage(spec.language());
     Path workspace = createWorkspace(spec, runtime);

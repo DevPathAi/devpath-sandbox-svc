@@ -4,7 +4,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.jwt;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.asyncDispatch;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
@@ -39,6 +42,7 @@ class RunControllerTest {
 
   @Test
   void validRequestReturnsSseStreamWithLogEvents() throws Exception {
+    doReturn(true).when(sandboxRunService).isRunnerAvailable();
     doAnswer(inv -> {
       java.util.function.Consumer<String> cb = inv.getArgument(2);
       cb.accept("Hello, World!");
@@ -64,7 +68,22 @@ class RunControllerTest {
   }
 
   @Test
-  void sandboxUnavailableReturns503() throws Exception {
+  void runnerUnavailableReturns503WithoutStreaming() throws Exception {
+    doReturn(false).when(sandboxRunService).isRunnerAvailable();
+
+    mvc.perform(post("/sandbox/run")
+            .with(jwt().jwt(j -> j.subject("42")))
+            .contentType(MediaType.APPLICATION_JSON)
+            .content("{\"code\":\"print(1)\",\"language\":\"PYTHON\"}"))
+        .andExpect(status().isServiceUnavailable());
+
+    // SSE 시작 전 차단이므로 실행 자체가 호출되지 않는다(세션·이벤트 찌꺼기 방지).
+    verify(sandboxRunService, never()).execute(anyLong(), any(), any());
+  }
+
+  @Test
+  void runtimeUnavailableDuringExecuteReturns503() throws Exception {
+    doReturn(true).when(sandboxRunService).isRunnerAvailable();
     doThrow(new SandboxUnavailableException("Docker 미가동"))
         .when(sandboxRunService).execute(anyLong(), any(), any());
 

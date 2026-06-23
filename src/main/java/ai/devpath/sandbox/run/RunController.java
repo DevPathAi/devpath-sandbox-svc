@@ -32,6 +32,10 @@ public class RunController {
   public SseEmitter run(@AuthenticationPrincipal Jwt jwt,
       @RequestBody SandboxRunRequest req) {
     validate(req);
+    // Docker 등 runner 불가 시 SSE 시작 전에 503으로 끊어 세션·이벤트 찌꺼기를 만들지 않는다.
+    if (!runService.isRunnerAvailable()) {
+      throw new SandboxUnavailableException("Sandbox runner is not available");
+    }
     long userId = Long.parseLong(jwt.getSubject());
     SseEmitter emitter = new SseEmitter(sseTimeoutMs);
 

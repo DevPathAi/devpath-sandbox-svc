@@ -10,6 +10,7 @@ class FakeRunnerBackend implements RunnerBackend {
   private RuntimeException failure;
   private final List<String> logs = new ArrayList<>();
   private RunSpec lastSpec;
+  private boolean available = true;
 
   void result(RunResult result) {
     this.result = result;
@@ -24,8 +25,17 @@ class FakeRunnerBackend implements RunnerBackend {
     logs.addAll(List.of(values));
   }
 
+  void available(boolean available) {
+    this.available = available;
+  }
+
   RunSpec lastSpec() {
     return lastSpec;
+  }
+
+  @Override
+  public boolean isAvailable() {
+    return available;
   }
 
   @Override

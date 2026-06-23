@@ -13,7 +13,7 @@ jobs:
       packages: read
     services:
       postgres:
-        image: postgres:17-alpine
+        image: pgvector/pgvector:pg17
         env:
           POSTGRES_USER: devpath
           POSTGRES_PASSWORD: localdev
@@ -32,11 +32,20 @@ jobs:
           distribution: temurin
           java-version: 21
       - uses: gradle/actions/setup-gradle@v6
-      - run: ./gradlew build
+      - run: ./gradlew --refresh-dependencies build "-Dgroups=!docker"
         env:
           DB_URL: jdbc:postgresql://localhost:5432/devpath
           DB_USER: devpath
           DB_PASSWORD: localdev
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Pull sandbox runtime images
+        run: |
+          docker pull eclipse-temurin:21-jdk
+          docker pull node:20-alpine
+          docker pull python:3.12-slim
+      - run: ./gradlew --refresh-dependencies test "-Dgroups=docker"
+        env:
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -54,7 +63,7 @@ jobs:
           distribution: temurin
           java-version: 21
       - uses: gradle/actions/setup-gradle@v6
-      - run: ./gradlew bootJar
+      - run: ./gradlew --refresh-dependencies bootJar
         env:
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -30,23 +30,53 @@ dependencies {
 	implementation("org.springframework.boot:spring-boot-starter-validation")
 	implementation("org.springframework.boot:spring-boot-starter-webmvc")
 	implementation("org.springframework.boot:spring-boot-starter-data-jpa")
+	implementation("org.springframework.boot:spring-boot-starter-security")
+	implementation("org.springframework.boot:spring-boot-starter-oauth2-resource-server")
+	implementation("org.springframework.kafka:spring-kafka")
+	implementation("org.springframework.boot:spring-boot-kafka")
 	implementation("ai.devpath:devpath-shared:0.0.1-SNAPSHOT")
+	implementation("com.github.docker-java:docker-java-core:3.5.1")
+	implementation("com.github.docker-java:docker-java-transport-httpclient5:3.5.1")
 	runtimeOnly("org.postgresql:postgresql")
 	// 서비스 특성에 따라 주석 해제해서 사용한다.
 	// implementation("org.springframework.boot:spring-boot-starter-data-redis")
-	// implementation("org.springframework.boot:spring-boot-starter-security")
-	// implementation("org.springframework.kafka:spring-kafka")
 	compileOnly("org.projectlombok:lombok")
 	annotationProcessor("org.projectlombok:lombok")
 	testImplementation("org.springframework.boot:spring-boot-starter-actuator-test")
 	testImplementation("org.springframework.boot:spring-boot-starter-validation-test")
 	testImplementation("org.springframework.boot:spring-boot-starter-webmvc-test")
+	testImplementation("org.springframework.boot:spring-boot-starter-security-test")
+	testImplementation("org.springframework.boot:spring-boot-starter-data-jpa-test")
+	testImplementation("org.springframework.kafka:spring-kafka-test")
+	testImplementation("org.springframework.boot:spring-boot-flyway")
+	testImplementation("org.flywaydb:flyway-core")
+	testImplementation("org.flywaydb:flyway-database-postgresql")
 	testCompileOnly("org.projectlombok:lombok")
 	testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 	testAnnotationProcessor("org.projectlombok:lombok")
 }
 
 tasks.withType<Test> {
-	useJUnitPlatform()
+	useJUnitPlatform {
+		val groups = System.getProperty("groups")
+		if (groups.isNullOrBlank()) {
+			excludeTags("docker")
+		} else {
+			val requestedGroups = groups.split(",")
+				.map { it.trim() }
+				.filter { it.isNotEmpty() }
+			val includedGroups = requestedGroups.filterNot { it.startsWith("!") }
+			val excludedGroups = requestedGroups
+				.filter { it.startsWith("!") }
+				.map { it.removePrefix("!") }
+
+			if (includedGroups.isNotEmpty()) {
+				includeTags(*includedGroups.toTypedArray())
+			}
+			if (excludedGroups.isNotEmpty()) {
+				excludeTags(*excludedGroups.toTypedArray())
+			}
+		}
+	}
 }
 

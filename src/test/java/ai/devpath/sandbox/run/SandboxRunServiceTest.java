@@ -100,4 +100,17 @@ class SandboxRunServiceTest {
 
     assertEquals(List.of("log-line-A", "log-line-B"), received);
   }
+
+  @Test
+  void backendFailureDoesNotPublishEvent() {
+    when(runnerBackend.run(any(), any()))
+        .thenThrow(new SandboxUnavailableException("Docker 미가동"));
+
+    long before = outboxRepo.count();
+    assertThrows(SandboxUnavailableException.class, () ->
+        service.execute(8L, new SandboxRunRequest("print(1)", "PYTHON", null, null), line -> {}));
+
+    assertEquals(before, outboxRepo.count(),
+        "실행이 완료되지 못하면(run throw) 리뷰 이벤트를 발행하지 않는다(발행은 finish에서)");
+  }
 }

@@ -22,7 +22,7 @@ public class SandboxRunPersistenceService {
     this.eventPublisher = eventPublisher;
   }
 
-  /** 세션 생성(ALLOCATING) + 제출 이벤트 발행(outbox) + RUNNING 전이. 짧은 tx. */
+  /** 세션 생성(ALLOCATING) + RUNNING 전이. 짧은 tx. (제출 이벤트는 finish에서 발행 — D-6) */
   @Transactional
   public SandboxSession createRunning(long userId, SandboxRunRequest req) {
     SandboxSession session = new SandboxSession();
@@ -35,13 +35,11 @@ public class SandboxRunPersistenceService {
     session.setStartedAt(Instant.now());
     session = sessions.save(session);
 
-    eventPublisher.publishSubmitted(session.getId(), userId, req.language(), req.contentId());
-
     session.setStatus("RUNNING");
     return sessions.save(session);
   }
 
-  /** 실행 결과 반영(상태머신·stdout/stderr·exit·리소스 사용량). 짧은 tx. */
+  /** 실행 결과 반영 + 완료 이벤트 발행(outbox). 짧은 tx. (D-6: 발행을 finish로 이전) */
   @Transactional
   public SandboxSession finish(SandboxSession session, RunResult result) {
     session.setFinishedAt(Instant.now());
@@ -57,6 +55,9 @@ public class SandboxRunPersistenceService {
     } else {
       session.setStatus("FAILED");
     }
-    return sessions.save(session);
+    SandboxSession saved = sessions.save(session);
+    eventPublisher.publishSubmitted(
+        saved.getId(), saved.getUserId(), saved.getLanguage(), saved.getContentId());
+    return saved;
   }
 }

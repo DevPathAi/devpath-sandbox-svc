@@ -116,4 +116,26 @@ class RunControllerTest {
             .content("{\"code\":\"print(1)\"}"))
         .andExpect(status().isBadRequest());
   }
+
+  @Test
+  void sseEmitsSessionIdEvent() throws Exception {
+    doReturn(true).when(sandboxRunService).isRunnerAvailable();
+    SandboxSession s = org.mockito.Mockito.mock(SandboxSession.class);
+    org.mockito.Mockito.when(s.getId()).thenReturn(99L);
+    doReturn(s).when(sandboxRunService).execute(anyLong(), any(), any());
+
+    var result = mvc.perform(post("/sandbox/run")
+            .with(jwt().jwt(j -> j.subject("42")))
+            .contentType(MediaType.APPLICATION_JSON)
+            .content("{\"code\":\"print(1)\",\"language\":\"PYTHON\"}"))
+        .andExpect(request().asyncStarted())
+        .andReturn();
+
+    String sse = mvc.perform(asyncDispatch(result))
+        .andExpect(status().isOk())
+        .andReturn().getResponse().getContentAsString();
+
+    assertThat(sse).contains("event:session");
+    assertThat(sse).contains("data:99");
+  }
 }

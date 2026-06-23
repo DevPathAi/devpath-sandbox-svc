@@ -41,7 +41,8 @@ public class RunController {
 
     CompletableFuture.runAsync(() -> {
       try {
-        runService.execute(userId, req, line -> sendLog(emitter, line));
+        SandboxSession session = runService.execute(userId, req, line -> sendLog(emitter, line));
+        sendSession(emitter, session.getId());
         emitter.complete();
       } catch (Exception e) {
         emitter.completeWithError(e);
@@ -66,6 +67,14 @@ public class RunController {
   private void sendLog(SseEmitter emitter, String line) {
     try {
       emitter.send(SseEmitter.event().name("log").data(line));
+    } catch (IOException e) {
+      throw new IllegalStateException("SSE send failed", e);
+    }
+  }
+
+  private void sendSession(SseEmitter emitter, Long sessionId) {
+    try {
+      emitter.send(SseEmitter.event().name("session").data(String.valueOf(sessionId)));
     } catch (IOException e) {
       throw new IllegalStateException("SSE send failed", e);
     }

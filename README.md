@@ -6,8 +6,7 @@
 
 | 모듈 | 역할 |
 |------|------|
-| runner | Docker Pool + gVisor(runsc) 격리 실행 |
-| submission | 과제 제출 접수 → 실행 → 결과 회수 |
+| run | Docker Pool + gVisor(runsc) 격리 실행, SSE 실행 로그(`POST /sandbox/run`) — 구현됨 |
 
 **아키텍처 원칙**: 보안상 코어와 무조건 분리된 격리 서비스입니다. 실행 컨테이너는 네트워크 차단 + 리소스 제한 + gVisor 샌드박스로 구동합니다.
 

@@ -54,7 +54,8 @@ class InternalSessionControllerTest {
   @Test
   void missingSessionReturns404() throws Exception {
     mvc.perform(get("/internal/sandbox/sessions/999999999"))
-        .andExpect(status().isNotFound());
+        .andExpect(status().isNotFound())
+        .andExpect(jsonPath("$.error.code").value("RESOURCE_NOT_FOUND"));
   }
 
   @Test

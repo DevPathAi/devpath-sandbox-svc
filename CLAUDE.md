@@ -43,8 +43,7 @@
 
 | 모듈 | 역할 |
 |------|------|
-| runner | Docker Pool + gVisor(runsc) 격리 실행 |
-| submission | 과제 제출 → 실행 → 결과 회수 |
+| run | Docker Pool + gVisor(runsc) 격리 실행, SSE 실행 로그(`POST /sandbox/run`) — 구현됨 |
 ## 공통 규칙
 
 - Git: Conventional Commits — [documents/09_Git_규칙_정의서](https://github.com/DevPathAi/documents/blob/main/09_Git_규칙_정의서.md)

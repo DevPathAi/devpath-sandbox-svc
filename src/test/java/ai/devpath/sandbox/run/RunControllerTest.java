@@ -82,7 +82,7 @@ class RunControllerTest {
   }
 
   @Test
-  void runtimeUnavailableDuringExecuteReturns503() throws Exception {
+  void runtimeUnavailableDuringExecute_emitsErrorEventWithSandboxUnavailableCode() throws Exception {
     doReturn(true).when(sandboxRunService).isRunnerAvailable();
     doThrow(new SandboxUnavailableException("Docker 미가동"))
         .when(sandboxRunService).execute(anyLong(), any(), any());
@@ -94,8 +94,35 @@ class RunControllerTest {
         .andExpect(request().asyncStarted())
         .andReturn();
 
-    mvc.perform(asyncDispatch(result))
-        .andExpect(status().isServiceUnavailable());
+    String sse = mvc.perform(asyncDispatch(result))
+        .andExpect(status().isOk())
+        .andExpect(content().contentTypeCompatibleWith(MediaType.TEXT_EVENT_STREAM))
+        .andReturn().getResponse().getContentAsString();
+
+    assertThat(sse).contains("event:error");
+    assertThat(sse).contains("\"code\":\"SANDBOX_UNAVAILABLE\"");
+  }
+
+  @Test
+  void executeThrowsUnexpectedException_emitsErrorEventAndCompletes() throws Exception {
+    doReturn(true).when(sandboxRunService).isRunnerAvailable();
+    doThrow(new RuntimeException("boom"))
+        .when(sandboxRunService).execute(anyLong(), any(), any());
+
+    var result = mvc.perform(post("/sandbox/run")
+            .with(jwt().jwt(j -> j.subject("42")))
+            .contentType(MediaType.APPLICATION_JSON)
+            .content("{\"code\":\"print(1)\",\"language\":\"PYTHON\"}"))
+        .andExpect(request().asyncStarted())
+        .andReturn();
+
+    String sse = mvc.perform(asyncDispatch(result))
+        .andExpect(status().isOk())
+        .andExpect(content().contentTypeCompatibleWith(MediaType.TEXT_EVENT_STREAM))
+        .andReturn().getResponse().getContentAsString();
+
+    assertThat(sse).contains("event:error");
+    assertThat(sse).contains("\"code\":\"INTERNAL_ERROR\"");
   }
 
   @Test

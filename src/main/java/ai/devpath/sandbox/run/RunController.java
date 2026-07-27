@@ -1,5 +1,8 @@
 package ai.devpath.sandbox.run;
 
+import ai.devpath.shared.error.ApiException;
+import ai.devpath.shared.error.ErrorCode;
+import ai.devpath.shared.error.SseSupport;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.CompletableFuture;
@@ -44,8 +47,12 @@ public class RunController {
         SandboxSession session = runService.execute(userId, req, line -> sendLog(emitter, line));
         sendSession(emitter, session.getId());
         emitter.complete();
+      } catch (ApiException e) {
+        SseSupport.sendError(emitter, e.code(), e.getMessage());
+        emitter.complete();
       } catch (Exception e) {
-        emitter.completeWithError(e);
+        SseSupport.sendError(emitter, ErrorCode.INTERNAL_ERROR, e.getMessage());
+        emitter.complete();
       }
     });
 

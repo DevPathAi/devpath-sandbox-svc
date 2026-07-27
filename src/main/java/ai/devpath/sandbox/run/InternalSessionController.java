@@ -2,13 +2,11 @@ package ai.devpath.sandbox.run;
 
 import java.util.List;
 import org.springframework.data.domain.PageRequest;
-import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
-import org.springframework.web.server.ResponseStatusException;
 
 /** 서비스 간 내부 조회(게이트웨이 미경유). ai-svc가 코드+결과(슬라이스 #6 D-7)·멘토 context(슬라이스 #7)를 가져온다. */
 @RestController
@@ -27,7 +25,7 @@ public class InternalSessionController {
   public SandboxSessionView get(@PathVariable long id) {
     return sessions.findById(id)
         .map(SandboxSessionView::from)
-        .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND));
+        .orElseThrow(() -> new SessionNotFoundException("sandbox session not found: " + id));
   }
 
   /** 사용자별 최근 실행(started_at DESC). 멘토 context_snapshot 주입용(슬라이스 #7 빌드 D 소비). */

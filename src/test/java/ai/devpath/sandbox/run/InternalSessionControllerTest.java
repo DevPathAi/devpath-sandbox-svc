@@ -34,9 +34,11 @@ class InternalSessionControllerTest {
     s.setLanguage("PYTHON");
     s.setSubmittedCode("print(1)");
     s.setContentId(7L);
+    s.setCodeBlockId(8L);
     s.setStatus("COMPLETED");
     s.setStdout("ok\n");
     s.setExitCode(0);
+    s.setOutputTruncated(true);
     s.setStartedAt(Instant.now());
     long id = sessions.save(s).getId();
 
@@ -45,9 +47,11 @@ class InternalSessionControllerTest {
         .andExpect(jsonPath("$.userId").value(42))
         .andExpect(jsonPath("$.language").value("PYTHON"))
         .andExpect(jsonPath("$.contentId").value(7))
+        .andExpect(jsonPath("$.codeBlockId").value(8))
         .andExpect(jsonPath("$.submittedCode").value("print(1)"))
         .andExpect(jsonPath("$.stdout").value("ok\n"))
         .andExpect(jsonPath("$.exitCode").value(0))
+        .andExpect(jsonPath("$.outputTruncated").value(true))
         .andExpect(jsonPath("$.status").value("COMPLETED"));
   }
 

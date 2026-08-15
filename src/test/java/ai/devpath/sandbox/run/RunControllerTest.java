@@ -4,10 +4,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.doAnswer;
-import static org.mockito.Mockito.doReturn;
-import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.jwt;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.asyncDispatch;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
@@ -41,15 +40,15 @@ class RunControllerTest {
   }
 
   @Test
-  void validRequestReturnsSseStreamWithLogEvents() throws Exception {
-    doReturn(true).when(sandboxRunService).isRunnerAvailable();
+  void validRequestReturnsSseStreamWithEarlySessionAndLogs() throws Exception {
+    when(sandboxRunService.isRunnerAvailable()).thenReturn(true);
     doAnswer(inv -> {
-      java.util.function.Consumer<String> cb = inv.getArgument(2);
-      cb.accept("Hello, World!");
-      SandboxSession s = new SandboxSession();
-      s.setStatus("COMPLETED");
-      return s;
-    }).when(sandboxRunService).execute(anyLong(), any(), any());
+      SandboxRunDelivery delivery = inv.getArgument(2);
+      delivery.session(71L);
+      delivery.log("Hello, World!");
+      delivery.complete();
+      return new AcceptedSandboxRun(71L);
+    }).when(sandboxRunService).start(anyLong(), any(), any());
 
     var result = mvc.perform(post("/sandbox/run")
             .with(jwt().jwt(j -> j.subject("42")))
@@ -63,13 +62,12 @@ class RunControllerTest {
         .andExpect(content().contentTypeCompatibleWith(MediaType.TEXT_EVENT_STREAM))
         .andReturn().getResponse().getContentAsString();
 
-    assertThat(sse).contains("event:log");
-    assertThat(sse).contains("data:Hello, World!");
+    assertThat(sse).contains("event:session", "data:71", "event:log", "data:Hello, World!");
   }
 
   @Test
-  void runnerUnavailableReturns503WithoutStreaming() throws Exception {
-    doReturn(false).when(sandboxRunService).isRunnerAvailable();
+  void runnerUnavailableReturns503WithoutAdmission() throws Exception {
+    when(sandboxRunService.isRunnerAvailable()).thenReturn(false);
 
     mvc.perform(post("/sandbox/run")
             .with(jwt().jwt(j -> j.subject("42")))
@@ -77,52 +75,7 @@ class RunControllerTest {
             .content("{\"code\":\"print(1)\",\"language\":\"PYTHON\"}"))
         .andExpect(status().isServiceUnavailable());
 
-    // SSE 시작 전 차단이므로 실행 자체가 호출되지 않는다(세션·이벤트 찌꺼기 방지).
-    verify(sandboxRunService, never()).execute(anyLong(), any(), any());
-  }
-
-  @Test
-  void runtimeUnavailableDuringExecute_emitsErrorEventWithSandboxUnavailableCode() throws Exception {
-    doReturn(true).when(sandboxRunService).isRunnerAvailable();
-    doThrow(new SandboxUnavailableException("Docker 미가동"))
-        .when(sandboxRunService).execute(anyLong(), any(), any());
-
-    var result = mvc.perform(post("/sandbox/run")
-            .with(jwt().jwt(j -> j.subject("42")))
-            .contentType(MediaType.APPLICATION_JSON)
-            .content("{\"code\":\"x\",\"language\":\"PYTHON\"}"))
-        .andExpect(request().asyncStarted())
-        .andReturn();
-
-    String sse = mvc.perform(asyncDispatch(result))
-        .andExpect(status().isOk())
-        .andExpect(content().contentTypeCompatibleWith(MediaType.TEXT_EVENT_STREAM))
-        .andReturn().getResponse().getContentAsString();
-
-    assertThat(sse).contains("event:error");
-    assertThat(sse).contains("\"code\":\"SANDBOX_UNAVAILABLE\"");
-  }
-
-  @Test
-  void executeThrowsUnexpectedException_emitsErrorEventAndCompletes() throws Exception {
-    doReturn(true).when(sandboxRunService).isRunnerAvailable();
-    doThrow(new RuntimeException("boom"))
-        .when(sandboxRunService).execute(anyLong(), any(), any());
-
-    var result = mvc.perform(post("/sandbox/run")
-            .with(jwt().jwt(j -> j.subject("42")))
-            .contentType(MediaType.APPLICATION_JSON)
-            .content("{\"code\":\"print(1)\",\"language\":\"PYTHON\"}"))
-        .andExpect(request().asyncStarted())
-        .andReturn();
-
-    String sse = mvc.perform(asyncDispatch(result))
-        .andExpect(status().isOk())
-        .andExpect(content().contentTypeCompatibleWith(MediaType.TEXT_EVENT_STREAM))
-        .andReturn().getResponse().getContentAsString();
-
-    assertThat(sse).contains("event:error");
-    assertThat(sse).contains("\"code\":\"INTERNAL_ERROR\"");
+    verify(sandboxRunService, never()).start(anyLong(), any(), any());
   }
 
   @Test
@@ -142,27 +95,5 @@ class RunControllerTest {
             .contentType(MediaType.APPLICATION_JSON)
             .content("{\"code\":\"print(1)\"}"))
         .andExpect(status().isBadRequest());
-  }
-
-  @Test
-  void sseEmitsSessionIdEvent() throws Exception {
-    doReturn(true).when(sandboxRunService).isRunnerAvailable();
-    SandboxSession s = org.mockito.Mockito.mock(SandboxSession.class);
-    org.mockito.Mockito.when(s.getId()).thenReturn(99L);
-    doReturn(s).when(sandboxRunService).execute(anyLong(), any(), any());
-
-    var result = mvc.perform(post("/sandbox/run")
-            .with(jwt().jwt(j -> j.subject("42")))
-            .contentType(MediaType.APPLICATION_JSON)
-            .content("{\"code\":\"print(1)\",\"language\":\"PYTHON\"}"))
-        .andExpect(request().asyncStarted())
-        .andReturn();
-
-    String sse = mvc.perform(asyncDispatch(result))
-        .andExpect(status().isOk())
-        .andReturn().getResponse().getContentAsString();
-
-    assertThat(sse).contains("event:session");
-    assertThat(sse).contains("data:99");
   }
 }

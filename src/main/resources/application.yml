@@ -3,6 +3,15 @@ devpath:
     jwt-secret: ${JWT_SECRET:test-secret-please-change-min-32-bytes-long-0123456789}
   sandbox:
     sse-timeout-ms: 60000
+    sse-heartbeat-ms: 10000
+    executor:
+      parallelism: ${SANDBOX_PARALLELISM:4}
+      queue-capacity: ${SANDBOX_QUEUE_CAPACITY:4}
+      drain-timeout-ms: ${SANDBOX_DRAIN_TIMEOUT_MS:75000}
+    reconcile:
+      stale-after-ms: ${SANDBOX_STALE_AFTER_MS:35000}
+      initial-delay-ms: ${SANDBOX_RECONCILE_INITIAL_DELAY_MS:5000}
+      fixed-delay-ms: ${SANDBOX_RECONCILE_DELAY_MS:5000}
 
 spring:
   application:

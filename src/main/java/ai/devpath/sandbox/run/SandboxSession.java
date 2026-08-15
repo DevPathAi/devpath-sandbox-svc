@@ -28,6 +28,7 @@ public class SandboxSession {
   @Column(name = "exit_code") private Integer exitCode;
   @Column(name = "cpu_ms_used") private Long cpuMsUsed;
   @Column(name = "memory_mb_peak") private Integer memoryMbPeak;
+  @Column(name = "output_truncated", nullable = false) private boolean outputTruncated;
   @Column(name = "started_at", nullable = false) private Instant startedAt;
   @Column(name = "finished_at") private Instant finishedAt;
   @Column(name = "created_at", nullable = false) private Instant createdAt;
@@ -71,10 +72,15 @@ public class SandboxSession {
   public void setCpuMsUsed(Long cpuMsUsed) { this.cpuMsUsed = cpuMsUsed; }
   public Integer getMemoryMbPeak() { return memoryMbPeak; }
   public void setMemoryMbPeak(Integer memoryMbPeak) { this.memoryMbPeak = memoryMbPeak; }
+  public boolean isOutputTruncated() { return outputTruncated; }
+  public void setOutputTruncated(boolean outputTruncated) {
+    this.outputTruncated = outputTruncated;
+  }
   public Instant getStartedAt() { return startedAt; }
   public void setStartedAt(Instant startedAt) { this.startedAt = startedAt; }
   public Instant getFinishedAt() { return finishedAt; }
   public void setFinishedAt(Instant finishedAt) { this.finishedAt = finishedAt; }
   public Instant getCreatedAt() { return createdAt; }
   public Instant getUpdatedAt() { return updatedAt; }
+  void setUpdatedAt(Instant updatedAt) { this.updatedAt = updatedAt; }
 }

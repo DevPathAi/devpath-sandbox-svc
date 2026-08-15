@@ -22,7 +22,7 @@ import org.springframework.test.web.servlet.request.RequestPostProcessor;
  * SandboxUnavailable은 스트림 개시 전 동기 throw(RunController)라 advice가 503 envelope를 낸다.
  */
 @WebMvcTest(RunController.class)
-@Import({SecurityConfig.class, ApiExceptionHandler.class})
+@Import({SecurityConfig.class, ApiExceptionHandler.class, SandboxHeartbeatScheduler.class})
 class RunControllerEnvelopeTest {
 
   @Autowired MockMvc mvc;
@@ -51,5 +51,19 @@ class RunControllerEnvelopeTest {
             .content("{\"code\":\"print(1)\"}"))
         .andExpect(status().isBadRequest())
         .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"));
+  }
+
+  @Test
+  void boundedAdmissionReturnsSandboxBusy429BeforeStreaming() throws Exception {
+    when(runService.isRunnerAvailable()).thenReturn(true);
+    when(runService.start(org.mockito.ArgumentMatchers.anyLong(),
+        org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
+        .thenThrow(new SandboxBusyException("Sandbox capacity is full"));
+
+    mvc.perform(post("/sandbox/run").with(user("42"))
+            .contentType(MediaType.APPLICATION_JSON)
+            .content("{\"code\":\"print(1)\",\"language\":\"PYTHON\"}"))
+        .andExpect(status().isTooManyRequests())
+        .andExpect(jsonPath("$.error.code").value("SANDBOX_BUSY"));
   }
 }

@@ -1,63 +1,124 @@
 package ai.devpath.sandbox.run;
 
+import jakarta.persistence.EntityManager;
 import java.time.Instant;
+import java.util.List;
+import java.util.Set;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-/**
- * 샌드박스 세션 영속을 짧은 트랜잭션으로 분리한다.
- * 컨테이너 실행(최대 30s)은 호출자(SandboxRunService)가 트랜잭션 밖에서 수행하고,
- * 세션 생성/이벤트 발행/결과 반영만 이 서비스의 짧은 @Transactional로 감싼다.
- * (learning-svc LearningPathPersistenceService 패턴 — 외부 I/O가 DB 커넥션을 점유하지 않도록)
- */
+/** Short transactions for the durable accepted-run lifecycle. */
 @Service
 public class SandboxRunPersistenceService {
 
+  private static final List<String> ACTIVE_STATUSES = List.of("ALLOCATING", "RUNNING");
+  private static final Set<String> TERMINAL_STATUSES = Set.of(
+      "COMPLETED", "FAILED", "KILLED", "TIMED_OUT");
+
   private final SandboxSessionRepository sessions;
   private final SandboxRunEventPublisher eventPublisher;
+  private final EntityManager entityManager;
 
-  public SandboxRunPersistenceService(SandboxSessionRepository sessions,
-      SandboxRunEventPublisher eventPublisher) {
+  public SandboxRunPersistenceService(
+      SandboxSessionRepository sessions,
+      SandboxRunEventPublisher eventPublisher,
+      EntityManager entityManager) {
     this.sessions = sessions;
     this.eventPublisher = eventPublisher;
+    this.entityManager = entityManager;
   }
 
-  /** 세션 생성(ALLOCATING) + RUNNING 전이. 짧은 tx. (제출 이벤트는 finish에서 발행 — D-6) */
+  /** Capacity has already been reserved; commit only ALLOCATING and its stable identifier. */
   @Transactional
-  public SandboxSession createRunning(long userId, SandboxRunRequest req) {
+  public SandboxSession allocate(long userId, SandboxRunRequest request) {
+    acquireUserAdmissionLock(userId);
+    if (sessions.existsByUserIdAndStatusIn(userId, ACTIVE_STATUSES)) {
+      throw new SandboxBusyException("A Sandbox run is already active");
+    }
+
     SandboxSession session = new SandboxSession();
     session.setUserId(userId);
-    session.setLanguage(req.language());
-    session.setSubmittedCode(req.code());
-    session.setContentId(req.contentId());
-    session.setCodeBlockId(req.codeBlockId());
+    session.setLanguage(request.language());
+    session.setSubmittedCode(request.code());
+    session.setContentId(request.contentId());
+    session.setCodeBlockId(request.codeBlockId());
     session.setStatus("ALLOCATING");
     session.setStartedAt(Instant.now());
-    session = sessions.save(session);
-
-    session.setStatus("RUNNING");
-    return sessions.save(session);
+    return sessions.saveAndFlush(session);
   }
 
-  /** 실행 결과 반영 + 완료 이벤트 발행(outbox). 짧은 tx. (D-6: 발행을 finish로 이전) */
   @Transactional
-  public SandboxSession finish(SandboxSession session, RunResult result) {
+  public boolean markRunning(long sessionId) {
+    SandboxSession session = sessions.findByIdForUpdate(sessionId)
+        .orElseThrow(() -> new SessionNotFoundException("sandbox session not found"));
+    if ("RUNNING".equals(session.getStatus())) {
+      return true;
+    }
+    if (!"ALLOCATING".equals(session.getStatus())) {
+      return false;
+    }
+    session.setStatus("RUNNING");
+    sessions.save(session);
+    return true;
+  }
+
+  /** Persist terminal state and its Review outbox entry in one transaction. */
+  @Transactional
+  public SandboxSession finish(long sessionId, RunResult rawResult) {
+    SandboxSession session = sessions.findByIdForUpdate(sessionId)
+        .orElseThrow(() -> new SessionNotFoundException("sandbox session not found"));
+    if (TERMINAL_STATUSES.contains(session.getStatus())) {
+      return session;
+    }
+
+    RunResult result = SandboxOutputLimits.limit(rawResult);
     session.setFinishedAt(Instant.now());
     session.setExitCode(result.exitCode());
     session.setStdout(result.stdout());
     session.setStderr(result.stderr());
     session.setCpuMsUsed(result.cpuMsUsed());
     session.setMemoryMbPeak(result.memoryMbPeak());
-    if (result.exitCode() == 0) {
-      session.setStatus("COMPLETED");
-    } else if (result.exitCode() == -1) {
-      session.setStatus("KILLED");
-    } else {
-      session.setStatus("FAILED");
-    }
+    session.setOutputTruncated(result.outputTruncated());
+    session.setStatus(result.terminalStatus().name());
     SandboxSession saved = sessions.save(session);
-    eventPublisher.publishSubmitted(
-        saved.getId(), saved.getUserId(), saved.getLanguage(), saved.getContentId());
+    publishTerminal(saved);
     return saved;
+  }
+
+  /** Reconcile accepted rows left non-terminal by process loss. */
+  @Transactional
+  public int reconcileStale(Instant cutoff) {
+    int reconciled = 0;
+    for (Long sessionId : sessions.findStaleIds(ACTIVE_STATUSES, cutoff)) {
+      SandboxSession session = sessions.findByIdForUpdate(sessionId).orElse(null);
+      if (session == null || TERMINAL_STATUSES.contains(session.getStatus())
+          || !session.getUpdatedAt().isBefore(cutoff)) {
+        continue;
+      }
+      SandboxTerminalStatus terminal = "ALLOCATING".equals(session.getStatus())
+          ? SandboxTerminalStatus.FAILED
+          : SandboxTerminalStatus.KILLED;
+      session.setStatus(terminal.name());
+      session.setFinishedAt(Instant.now());
+      session.setExitCode(terminal == SandboxTerminalStatus.FAILED ? 1 : -1);
+      SandboxSession saved = sessions.save(session);
+      publishTerminal(saved);
+      reconciled++;
+    }
+    return reconciled;
+  }
+
+  private void acquireUserAdmissionLock(long userId) {
+    Object acquired = entityManager.createNativeQuery("SELECT pg_try_advisory_xact_lock(:userId)")
+        .setParameter("userId", userId)
+        .getSingleResult();
+    if (!Boolean.TRUE.equals(acquired)) {
+      throw new SandboxBusyException("A Sandbox run is already active");
+    }
+  }
+
+  private void publishTerminal(SandboxSession session) {
+    eventPublisher.publishSubmitted(
+        session.getId(), session.getUserId(), session.getLanguage(), session.getContentId());
   }
 }

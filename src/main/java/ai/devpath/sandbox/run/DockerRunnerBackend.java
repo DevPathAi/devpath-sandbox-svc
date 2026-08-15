@@ -59,8 +59,7 @@ public class DockerRunnerBackend implements RunnerBackend {
     DockerClient docker = null;
     String containerId = null;
     ResultCallback.Adapter<Frame> logStream = null;
-    StringBuilder stdout = new StringBuilder();
-    StringBuilder stderr = new StringBuilder();
+    SandboxOutputCapture output = new SandboxOutputCapture();
 
     try {
       docker = createDockerClient();
@@ -100,7 +99,7 @@ public class DockerRunnerBackend implements RunnerBackend {
           .exec(new ResultCallback.Adapter<>() {
             @Override
             public void onNext(Frame frame) {
-              appendFrame(frame, stdout, stderr, logCallback);
+              appendFrame(frame, output, logCallback);
             }
           });
 
@@ -111,14 +110,21 @@ public class DockerRunnerBackend implements RunnerBackend {
         killQuietly(docker, containerId);
         awaitLogs(logStream);
         String message = "Execution timed out after " + TIMEOUT_SECONDS + "s\n";
-        stderr.append(message);
-        logCallback.accept(message.stripTrailing());
-        return new RunResult(-1, stdout.toString(), stderr.toString(), null, null);
+        String accepted = output.appendStderr(message);
+        if (!accepted.isEmpty()) {
+          logCallback.accept(accepted.stripTrailing());
+        }
+        return output.result(SandboxTerminalStatus.TIMED_OUT, -1, null, null);
       }
 
       Integer exitCode = waitCallback.awaitStatusCode();
       awaitLogs(logStream);
-      return new RunResult(exitCode == null ? -1 : exitCode, stdout.toString(), stderr.toString(), null, null);
+      int resolvedExitCode = exitCode == null ? -1 : exitCode;
+      return output.result(
+          SandboxTerminalStatus.fromLegacyExitCode(resolvedExitCode),
+          resolvedExitCode,
+          null,
+          null);
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
       throw new SandboxUnavailableException("Interrupted while waiting for sandbox container", e);
@@ -182,17 +188,17 @@ public class DockerRunnerBackend implements RunnerBackend {
 
   private static void appendFrame(
       Frame frame,
-      StringBuilder stdout,
-      StringBuilder stderr,
+      SandboxOutputCapture output,
       Consumer<String> logCallback) {
     String chunk = new String(frame.getPayload(), StandardCharsets.UTF_8);
+    String accepted;
     if (frame.getStreamType() == StreamType.STDERR) {
-      stderr.append(chunk);
+      accepted = output.appendStderr(chunk);
     } else {
-      stdout.append(chunk);
+      accepted = output.appendStdout(chunk);
     }
 
-    String line = chunk.stripTrailing();
+    String line = accepted.stripTrailing();
     if (!line.isEmpty()) {
       logCallback.accept(line);
     }

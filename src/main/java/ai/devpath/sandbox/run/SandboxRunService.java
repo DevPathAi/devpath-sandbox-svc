@@ -1,39 +1,88 @@
 package ai.devpath.sandbox.run;
 
-import java.util.function.Consumer;
+import java.util.concurrent.atomic.AtomicReference;
 import org.springframework.stereotype.Service;
 
-/**
- * 샌드박스 실행 오케스트레이션.
- * 세션 생성/이벤트/결과 영속은 짧은 @Transactional(SandboxRunPersistenceService),
- * 컨테이너 실행(최대 30s)은 트랜잭션 밖에서 수행해 DB 커넥션을 장기 점유하지 않는다.
- */
+/** Orchestrates accepted runs without letting SSE delivery control execution persistence. */
 @Service
 public class SandboxRunService {
 
   private final SandboxRunPersistenceService persistence;
   private final RunnerBackend runnerBackend;
+  private final SandboxRunExecutor executor;
 
-  public SandboxRunService(SandboxRunPersistenceService persistence,
-      RunnerBackend runnerBackend) {
+  public SandboxRunService(
+      SandboxRunPersistenceService persistence,
+      RunnerBackend runnerBackend,
+      SandboxRunExecutor executor) {
     this.persistence = persistence;
     this.runnerBackend = runnerBackend;
+    this.executor = executor;
   }
 
-  /**
-   * runner 가용성(예: Docker 데몬). RunController가 SSE 시작 전에 호출해
-   * 불가 시 세션·이벤트를 생성하지 않고 503으로 빠르게 종료한다.
-   */
   public boolean isRunnerAvailable() {
     return runnerBackend.isAvailable();
   }
 
-  public SandboxSession execute(long userId, SandboxRunRequest req, Consumer<String> logCallback) {
-    SandboxSession session = persistence.createRunning(userId, req);
+  /** Returns only after ALLOCATING is committed and the execution task is admitted. */
+  public AcceptedSandboxRun start(
+      long userId,
+      SandboxRunRequest request,
+      SandboxRunDelivery delivery) {
+    AtomicReference<AcceptedSandboxRun> accepted = new AtomicReference<>();
+    executor.submit(userId, () -> {
+      SandboxSession session = persistence.allocate(userId, request);
+      long sessionId = session.getId();
+      accepted.set(new AcceptedSandboxRun(sessionId));
+      deliver(() -> delivery.session(sessionId));
+      return () -> executeAccepted(sessionId, request, delivery);
+    });
+    return accepted.get();
+  }
 
-    RunResult result = runnerBackend.run(
-        new RunSpec(req.code(), req.language(), session.getId()), logCallback);
+  private void executeAccepted(
+      long sessionId,
+      SandboxRunRequest request,
+      SandboxRunDelivery delivery) {
+    try {
+      if (!persistence.markRunning(sessionId)) {
+        deliver(delivery::complete);
+        return;
+      }
+    } catch (RuntimeException persistenceFailure) {
+      deliver(delivery::complete);
+      return;
+    }
 
-    return persistence.finish(session, result);
+    RunResult result;
+    try {
+      result = runnerBackend.run(
+          new RunSpec(request.code(), request.language(), sessionId),
+          line -> deliver(() -> delivery.log(line)));
+    } catch (RuntimeException runnerFailure) {
+      SandboxTerminalStatus status = Thread.currentThread().isInterrupted()
+          ? SandboxTerminalStatus.KILLED
+          : SandboxTerminalStatus.FAILED;
+      int exitCode = status == SandboxTerminalStatus.KILLED ? -1 : 1;
+      result = new RunResult(status, exitCode, "", "", null, null, false);
+    }
+
+    try {
+      SandboxSession terminal = persistence.finish(sessionId, SandboxOutputLimits.limit(result));
+      executor.recordTerminal(terminal);
+      deliver(() -> delivery.result(SandboxTerminalEvent.from(terminal)));
+    } catch (RuntimeException persistenceFailure) {
+      // Reconciliation owns a RUNNING row whose terminal transaction could not commit.
+    } finally {
+      deliver(delivery::complete);
+    }
+  }
+
+  private static void deliver(Runnable action) {
+    try {
+      action.run();
+    } catch (RuntimeException ignored) {
+      // Delivery is best-effort and cannot cancel or relabel an accepted execution.
+    }
   }
 }

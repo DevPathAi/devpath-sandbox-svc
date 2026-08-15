@@ -125,18 +125,36 @@ public class SandboxRunPersistenceService {
         exactOwnerInstance, Instant.now().plusMillis(leaseDurationMs));
   }
 
+  @Transactional(readOnly = true)
+  public long countExpiredActive(Instant now, Instant legacyCutoff) {
+    return sessions.countExpiredActive(now, legacyCutoff);
+  }
+
   /** Persist terminal state and its Review outbox entry in one transaction. */
   @Transactional
   public SandboxSession finish(long sessionId, RunResult rawResult) {
     SandboxSession session = sessions.findByIdForUpdate(sessionId)
         .orElseThrow(() -> new SessionNotFoundException("sandbox session not found"));
-    if (TERMINAL_STATUSES.contains(session.getStatus()) && !canCorrect(session)) {
-      publishTerminal(session);
+    boolean eventExists = eventPublisher.terminalEventExists(sessionId);
+    if (eventExists) {
+      requireTerminalPointOfNoReturn(session);
       return session;
+    }
+    if (TERMINAL_STATUSES.contains(session.getStatus())) {
+      if (!canCorrect(session)) {
+        if (!"RECONCILER".equals(session.getTerminalSource()) && !publishTerminal(session)) {
+          throw new IllegalStateException("Sandbox terminal event already exists");
+        }
+        return session;
+      }
     }
 
     SandboxSession saved = applyTerminal(session, rawResult);
-    publishTerminal(saved);
+    if (!publishTerminal(saved)) {
+      // A writer that did not honor the session-row fence inserted first. Roll this transaction
+      // back rather than changing a terminal result an outbox relay may already have observed.
+      throw new IllegalStateException("Sandbox terminal event already exists");
+    }
     return saved;
   }
 
@@ -145,8 +163,14 @@ public class SandboxRunPersistenceService {
   public SandboxSession finishWithoutEvent(long sessionId, RunResult rawResult) {
     SandboxSession session = sessions.findByIdForUpdate(sessionId)
         .orElseThrow(() -> new SessionNotFoundException("sandbox session not found"));
-    if (TERMINAL_STATUSES.contains(session.getStatus()) && !canCorrect(session)) {
+    if (eventPublisher.terminalEventExists(sessionId)) {
+      requireTerminalPointOfNoReturn(session);
       return session;
+    }
+    if (TERMINAL_STATUSES.contains(session.getStatus())) {
+      if (!canCorrect(session)) {
+        return session;
+      }
     }
     return applyTerminal(session, rawResult);
   }
@@ -166,6 +190,9 @@ public class SandboxRunPersistenceService {
     int inserted = 0;
     for (SandboxSession session : sessions.findTerminalWithoutOutbox(
         reconciliationPublishCutoff, batchSize)) {
+      if (!canPublishTerminal(session, reconciliationPublishCutoff)) {
+        continue;
+      }
       if (eventPublisher.publishSubmitted(
           session.getId(), session.getUserId(), session.getLanguage(), session.getContentId())) {
         inserted++;
@@ -241,8 +268,8 @@ public class SandboxRunPersistenceService {
     }
   }
 
-  private void publishTerminal(SandboxSession session) {
-    eventPublisher.publishSubmitted(
+  private boolean publishTerminal(SandboxSession session) {
+    return eventPublisher.publishSubmitted(
         session.getId(), session.getUserId(), session.getLanguage(), session.getContentId());
   }
 
@@ -265,6 +292,29 @@ public class SandboxRunPersistenceService {
 
   private boolean canCorrect(SandboxSession session) {
     return "RECONCILER".equals(session.getTerminalSource())
-        && ownerInstance.equals(session.getOwnerInstance());
+        && ownerInstance.equals(session.getOwnerInstance())
+        && session.getReconciliationToken() != null
+        && session.getReconciliationStartedAt() != null;
+  }
+
+  private static void requireTerminalPointOfNoReturn(SandboxSession session) {
+    if (!TERMINAL_STATUSES.contains(session.getStatus())) {
+      throw new IllegalStateException(
+          "Sandbox terminal event exists while its session is still active");
+    }
+  }
+
+  private boolean canPublishTerminal(
+      SandboxSession session,
+      Instant reconciliationPublishCutoff) {
+    if (eventPublisher.terminalEventExists(session.getId())) {
+      return false;
+    }
+    if (!"RECONCILER".equals(session.getTerminalSource())) {
+      return true;
+    }
+    return session.getReconciliationToken() != null
+        && session.getReconciliationStartedAt() != null
+        && !session.getReconciliationStartedAt().isAfter(reconciliationPublishCutoff);
   }
 }

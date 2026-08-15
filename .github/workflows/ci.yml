@@ -31,8 +31,14 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: DevPathAi/devpath-shared
-          ref: 2b03c38934fdd19332da59107e4330a3af92d078
+          ref: d3cf41faf21d00b815b398a7492af5506390151a
           path: .ci/devpath-shared
+      - name: Checkout immutable ET8 migration checkpoint
+        uses: actions/checkout@v6
+        with:
+          repository: DevPathAi/devpath-shared
+          ref: 2b03c38934fdd19332da59107e4330a3af92d078
+          path: .ci/devpath-shared-et8
       - name: Checkout historical published migration lineage
         uses: actions/checkout@v6
         with:
@@ -44,10 +50,12 @@ jobs:
           distribution: temurin
           java-version: 21
       - uses: gradle/actions/setup-gradle@v6
-      - name: Validate historical lineage then migrate in place to the final contract
+      - name: Validate published history, ET8 checkpoint, and final shared lineage
         run: ./gradlew test --tests "ai.devpath.sandbox.SharedMigrationUpgradePathTest"
         env:
           HISTORICAL_SHARED_MIGRATIONS: ${{ github.workspace }}/.ci/devpath-shared-history/src/main/resources/db/migration
+          ET8_SHARED_MIGRATIONS: ${{ github.workspace }}/.ci/devpath-shared-et8/src/main/resources/db/migration
+          FINAL_SHARED_VERSION: 202608161011
           DB_URL: jdbc:postgresql://localhost:5432/devpath
           DB_USER: devpath
           DB_PASSWORD: localdev
@@ -83,7 +91,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: DevPathAi/devpath-shared
-          ref: 2b03c38934fdd19332da59107e4330a3af92d078
+          ref: d3cf41faf21d00b815b398a7492af5506390151a
           path: .ci/devpath-shared
       - uses: actions/setup-java@v5
         with:

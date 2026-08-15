@@ -33,6 +33,10 @@ public class SandboxRunEventPublisher {
         dedupeKey) == 1;
   }
 
+  public boolean terminalEventExists(long sandboxSessionId) {
+    return outbox.existsSandboxTerminal(String.valueOf(sandboxSessionId));
+  }
+
   private String serialize(SandboxRunSubmittedEvent event) {
     try {
       return jsonMapper.writeValueAsString(event);

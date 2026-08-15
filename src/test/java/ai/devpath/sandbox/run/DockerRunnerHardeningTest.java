@@ -2,6 +2,7 @@ package ai.devpath.sandbox.run;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
@@ -14,9 +15,14 @@ import com.github.dockerjava.api.command.ListVolumesCmd;
 import com.github.dockerjava.api.command.ListVolumesResponse;
 import com.github.dockerjava.api.command.PingCmd;
 import com.github.dockerjava.api.command.RemoveVolumeCmd;
+import com.github.dockerjava.api.model.Frame;
+import com.github.dockerjava.api.model.StreamType;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 
 class DockerRunnerHardeningTest {
@@ -110,6 +116,45 @@ class DockerRunnerHardeningTest {
   }
 
   @Test
+  void incompleteLogDrainClosesDecodersAndLateFramesOnlyMarkTheResultTruncated() {
+    java.util.List<String> delivered = new java.util.concurrent.CopyOnWriteArrayList<>();
+    DockerLogCapture capture = new DockerLogCapture(delivered::add);
+    byte[] output = "완료🙂".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+
+    capture.onFrame(new Frame(
+        StreamType.STDOUT, java.util.Arrays.copyOfRange(output, 0, output.length - 1)));
+    capture.finish(false);
+    capture.onFrame(new Frame(
+        StreamType.STDOUT, java.util.Arrays.copyOfRange(output, output.length - 1, output.length)));
+    RunResult result = capture.result(SandboxTerminalStatus.FAILED, 1, null, null);
+
+    assertThat(java.nio.charset.StandardCharsets.UTF_8.newEncoder().canEncode(result.stdout()))
+        .isTrue();
+    assertThat(result.stdout()).startsWith("완료");
+    assertThat(result.outputTruncated()).isTrue();
+    assertThat(delivered).isNotEmpty();
+  }
+
+  @Test
+  void transportFailureAfterContainerStartCarriesCapturedStdoutAndStderr() {
+    DockerLogCapture capture = new DockerLogCapture(ignored -> {});
+    capture.onFrame(new Frame(
+        StreamType.STDOUT,
+        "부분🙂".getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+    capture.onFrame(new Frame(
+        StreamType.STDERR,
+        "경고".getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+
+    SandboxRunnerExecutionException failure = DockerRunnerBackend.executionFailure(
+        capture, new IllegalStateException("transport closed"), false);
+
+    assertThat(failure.result().terminalStatus()).isEqualTo(SandboxTerminalStatus.FAILED);
+    assertThat(failure.result().stdout()).isEqualTo("부분🙂");
+    assertThat(failure.result().stderr()).isEqualTo("경고");
+    assertThat(failure.result().outputTruncated()).isTrue();
+  }
+
+  @Test
   void failedPingStillClosesDockerClientAndTransport() throws Exception {
     SandboxRunnerProperties properties =
         new SandboxRunnerProperties("tcp://runner:2376", "runsc", true, true, "/certs");
@@ -124,6 +169,38 @@ class DockerRunnerHardeningTest {
     assertThat(backend.isAvailable()).isFalse();
 
     verify(client).close();
+  }
+
+  @Test
+  void shortenedSetupDeadlineInterruptsABlockingRemoteOperationAndReturnsExactFailure()
+      throws Exception {
+    DockerClient client = mock(DockerClient.class);
+    PingCmd ping = mock(PingCmd.class);
+    when(client.pingCmd()).thenReturn(ping);
+    CountDownLatch remoteStarted = new CountDownLatch(1);
+    when(ping.exec()).thenAnswer(invocation -> {
+      remoteStarted.countDown();
+      new CountDownLatch(1).await();
+      return null;
+    });
+    SandboxDockerClientFactory factory = mock(SandboxDockerClientFactory.class);
+    when(factory.create()).thenReturn(client);
+    DockerRunnerBackend backend = new DockerRunnerBackend(
+        SandboxRunnerProperties.development(), factory, Duration.ofMillis(75));
+
+    long startedAt = System.nanoTime();
+    SandboxRunnerExecutionException failure = assertThrows(
+        SandboxRunnerExecutionException.class,
+        () -> backend.run(
+            new RunSpec("print('never started')", "PYTHON", 92L),
+            ignored -> {}));
+
+    assertThat(remoteStarted.await(1, TimeUnit.SECONDS)).isTrue();
+    assertThat(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)).isLessThan(2_000L);
+    assertThat(failure.result().terminalStatus()).isEqualTo(SandboxTerminalStatus.FAILED);
+    assertThat(failure.result().outputTruncated()).isTrue();
+    assertThat(Thread.currentThread().isInterrupted()).isFalse();
+    verify(client, atLeastOnce()).close();
   }
 
   @Test

@@ -134,9 +134,50 @@ class SandboxRunServiceLifecycleTest {
 
     assertThat(queued.sessionId()).isEqualTo(202L);
     assertThat(queuedCompleted.await(1, TimeUnit.SECONDS)).isTrue();
+    verify(backend).cancel(201L);
     verify(persistence, atLeastOnce()).finish(eq(202L),
         org.mockito.ArgumentMatchers.argThat(
             result -> result.terminalStatus() == SandboxTerminalStatus.KILLED));
+  }
+
+  @Test
+  void structuredRunnerFailurePersistsCapturedUtf8PartialOutputInsteadOfEmptyStrings()
+      throws Exception {
+    SandboxRunPersistenceService persistence = mock(SandboxRunPersistenceService.class);
+    RunnerBackend backend = mock(RunnerBackend.class);
+    SimpleMeterRegistry metrics = new SimpleMeterRegistry();
+    executor = new SandboxRunExecutor(1, 0, 2_000, metrics);
+    SandboxTerminalFinalizer finalizer = new SandboxTerminalFinalizer(persistence, metrics, 1);
+    SandboxRunService service = new SandboxRunService(persistence, backend, executor, finalizer);
+    SandboxSession allocated = mock(SandboxSession.class);
+    SandboxSession terminal = mock(SandboxSession.class);
+    when(allocated.getId()).thenReturn(301L);
+    when(persistence.allocate(anyLong(), any())).thenReturn(allocated);
+    when(persistence.markRunning(301L)).thenReturn(true);
+    RunResult captured = new RunResult(
+        SandboxTerminalStatus.FAILED, 1, "중간🙂", "runner transport closed", null, null, true);
+    when(backend.run(any(), any(), any())).thenThrow(
+        new SandboxRunnerExecutionException("runner transport failed", captured));
+    when(persistence.finish(eq(301L), any())).thenReturn(terminal);
+    when(terminal.getId()).thenReturn(301L);
+    when(terminal.getStatus()).thenReturn("FAILED");
+    when(terminal.getExitCode()).thenReturn(1);
+    CountDownLatch completed = new CountDownLatch(1);
+    SandboxRunDelivery delivery = new SandboxRunDelivery() {
+      @Override public void session(long sessionId) {}
+      @Override public void log(String line) {}
+      @Override public void result(SandboxTerminalEvent event) {}
+      @Override public void complete() { completed.countDown(); }
+    };
+
+    service.start(3L, new SandboxRunRequest("print(1)", "PYTHON", null, null), delivery);
+
+    assertThat(completed.await(1, TimeUnit.SECONDS)).isTrue();
+    verify(persistence).finish(eq(301L), org.mockito.ArgumentMatchers.argThat(result ->
+        result.terminalStatus() == SandboxTerminalStatus.FAILED
+            && result.stdout().equals("중간🙂")
+            && result.stderr().equals("runner transport closed")
+            && result.outputTruncated()));
   }
 
   private static SandboxRunDelivery noOpDelivery() {

@@ -8,7 +8,6 @@ import com.github.dockerjava.api.model.Bind;
 import com.github.dockerjava.api.model.Capability;
 import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.HostConfig;
-import com.github.dockerjava.api.model.StreamType;
 import com.github.dockerjava.api.model.Volume;
 import com.github.dockerjava.core.DefaultDockerClientConfig;
 import com.github.dockerjava.core.DockerClientConfig;
@@ -25,7 +24,13 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
 import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
@@ -36,6 +41,7 @@ import org.springframework.stereotype.Component;
 public class DockerRunnerBackend implements RunnerBackend {
 
   private static final int TIMEOUT_SECONDS = 30;
+  private static final int SETUP_DEADLINE_SECONDS = 20;
   private static final int SETUP_ORPHAN_DEADLINE_SECONDS = 4 * 45 + 15;
   // Container creation, durable attach, and start are bounded remote operations that happen
   // after labels are fixed. Their headroom cannot consume the user's execution timeout.
@@ -47,9 +53,17 @@ public class DockerRunnerBackend implements RunnerBackend {
   static final String MANAGED_LABEL = "ai.devpath.sandbox.managed";
   static final String SESSION_LABEL = "ai.devpath.sandbox.session-id";
   static final String DEADLINE_LABEL = "ai.devpath.sandbox.deadline";
+  private static final ScheduledExecutorService DEADLINE_SCHEDULER =
+      Executors.newSingleThreadScheduledExecutor(task -> {
+        Thread thread = new Thread(task, "sandbox-runner-deadline");
+        thread.setDaemon(true);
+        return thread;
+      });
 
   private final SandboxRunnerProperties properties;
   private final SandboxDockerClientFactory clientFactory;
+  private final long setupDeadlineMs;
+  private final ConcurrentMap<Long, ActiveExecution> activeExecutions = new ConcurrentHashMap<>();
 
   public DockerRunnerBackend() {
     this(SandboxRunnerProperties.development());
@@ -63,8 +77,19 @@ public class DockerRunnerBackend implements RunnerBackend {
   DockerRunnerBackend(
       SandboxRunnerProperties properties,
       SandboxDockerClientFactory clientFactory) {
+    this(properties, clientFactory, Duration.ofSeconds(SETUP_DEADLINE_SECONDS));
+  }
+
+  DockerRunnerBackend(
+      SandboxRunnerProperties properties,
+      SandboxDockerClientFactory clientFactory,
+      Duration setupDeadline) {
+    if (setupDeadline == null || setupDeadline.isZero() || setupDeadline.isNegative()) {
+      throw new IllegalArgumentException("Sandbox setup deadline must be positive");
+    }
     this.properties = properties;
     this.clientFactory = clientFactory;
+    this.setupDeadlineMs = Math.max(1L, setupDeadline.toMillis());
   }
 
   @Override
@@ -95,13 +120,22 @@ public class DockerRunnerBackend implements RunnerBackend {
     String loaderContainerId = null;
     String sourceVolume = null;
     ResultCallback.Adapter<Frame> logStream = null;
-    SandboxOutputCapture output = new SandboxOutputCapture();
-    Utf8StreamDecoder stdoutDecoder = new Utf8StreamDecoder();
-    Utf8StreamDecoder stderrDecoder = new Utf8StreamDecoder();
+    DockerLogCapture capture = new DockerLogCapture(logCallback);
+    ActiveExecution active = new ActiveExecution(Thread.currentThread());
+    if (activeExecutions.putIfAbsent(spec.sandboxSessionId(), active) != null) {
+      throw new SandboxUnavailableException("Sandbox session is already executing");
+    }
+    ScheduledFuture<?> setupDeadline = DEADLINE_SCHEDULER.schedule(
+        active::cancelForSetupDeadline, setupDeadlineMs, TimeUnit.MILLISECONDS);
+    boolean executionStartRequested = false;
+    boolean containerStarted = false;
 
     try {
+      active.throwIfCancelled();
       docker = openClient();
+      active.attachDocker(docker);
       docker.pingCmd().exec();
+      active.throwIfCancelled();
 
       Instant setupStarted = Instant.now();
       Map<String, String> volumeLabels = volumeLabels(spec.sandboxSessionId(), setupStarted);
@@ -110,6 +144,7 @@ public class DockerRunnerBackend implements RunnerBackend {
           .withName(sourceVolume)
           .withLabels(volumeLabels)
           .exec();
+      active.throwIfCancelled();
 
       Map<String, String> setupLabels =
           setupLabels(spec.sandboxSessionId(), Instant.now());
@@ -123,13 +158,17 @@ public class DockerRunnerBackend implements RunnerBackend {
           .withLabels(setupLabels)
           .exec();
       loaderContainerId = loader.getId();
+      active.attachContainer(loaderContainerId);
       docker.startContainerCmd(loaderContainerId).exec();
+      active.throwIfCancelled();
       docker.copyArchiveToContainerCmd(loaderContainerId)
           .withRemotePath("/workspace")
           .withTarInputStream(new ByteArrayInputStream(sourceArchive))
           .exec();
       removeContainerQuietly(docker, loaderContainerId);
       loaderContainerId = null;
+      active.attachContainer(null);
+      active.throwIfCancelled();
 
       HostConfig hostConfig = hardenedHostConfig(sourceVolume, properties);
       // Setup and source transfer do not consume the user's 30-second execution window.
@@ -146,11 +185,17 @@ public class DockerRunnerBackend implements RunnerBackend {
           .withLabels(executionLabels)
           .exec();
       containerId = container.getId();
+      active.attachContainer(containerId);
 
       // Persistence callback is intentionally before startContainerCmd. A failed
       // durable write removes the never-started container in finally.
       containerCreated.accept(containerId);
+      active.throwIfCancelled();
+      executionStartRequested = true;
       docker.startContainerCmd(containerId).exec();
+      containerStarted = true;
+      active.markExecutionStarted();
+      setupDeadline.cancel(false);
 
       logStream = docker.logContainerCmd(containerId)
           .withStdOut(true)
@@ -160,53 +205,95 @@ public class DockerRunnerBackend implements RunnerBackend {
           .exec(new ResultCallback.Adapter<>() {
             @Override
             public void onNext(Frame frame) {
-              appendFrame(
-                  frame, output, logCallback, stdoutDecoder, stderrDecoder);
+              capture.onFrame(frame);
             }
           });
+      active.attachLogStream(logStream);
 
       WaitContainerResultCallback waitCallback = new WaitContainerResultCallback();
       docker.waitContainerCmd(containerId).exec(waitCallback);
       boolean completed = waitCallback.awaitCompletion(TIMEOUT_SECONDS, TimeUnit.SECONDS);
       if (!completed) {
         killQuietly(docker, containerId);
-        awaitLogs(logStream);
-        finishDecoders(output, logCallback, stdoutDecoder, stderrDecoder);
-        String message = "Execution timed out after " + TIMEOUT_SECONDS + "s\n";
-        String accepted = output.appendStderr(message);
-        if (!accepted.isEmpty()) {
-          logCallback.accept(accepted.stripTrailing());
+        boolean logsCompleted = awaitLogs(logStream);
+        if (!logsCompleted) {
+          closeQuietly(logStream);
         }
-        return output.result(SandboxTerminalStatus.TIMED_OUT, -1, null, null);
+        capture.finish(logsCompleted);
+        String message = "Execution timed out after " + TIMEOUT_SECONDS + "s\n";
+        capture.appendStderr(message);
+        return capture.result(SandboxTerminalStatus.TIMED_OUT, -1, null, null);
       }
 
       Integer exitCode = waitCallback.awaitStatusCode();
-      awaitLogs(logStream);
-      finishDecoders(output, logCallback, stdoutDecoder, stderrDecoder);
+      boolean logsCompleted = awaitLogs(logStream);
+      if (!logsCompleted) {
+        closeQuietly(logStream);
+      }
+      capture.finish(logsCompleted);
       int resolvedExitCode = exitCode == null ? -1 : exitCode;
-      return output.result(
+      return capture.result(
           SandboxTerminalStatus.fromLegacyExitCode(resolvedExitCode),
           resolvedExitCode,
           null,
           null);
     } catch (InterruptedException e) {
-      Thread.currentThread().interrupt();
+      Thread.interrupted();
+      closeQuietly(logStream);
+      capture.finish(false);
+      if (active.setupDeadlineExpired()) {
+        throw new SandboxRunnerExecutionException(
+            "Sandbox setup deadline exceeded",
+            e,
+            capture.result(SandboxTerminalStatus.FAILED, 1, null, null));
+      }
+      if (executionStartRequested || containerStarted || active.cancelled()) {
+        throw executionFailure(capture, e, true);
+      }
       throw new SandboxUnavailableException("Interrupted while waiting for sandbox container", e);
     } catch (RuntimeException e) {
+      closeQuietly(logStream);
+      capture.finish(false);
+      if (active.setupDeadlineExpired()) {
+        throw new SandboxRunnerExecutionException(
+            "Sandbox setup deadline exceeded",
+            e,
+            capture.result(SandboxTerminalStatus.FAILED, 1, null, null));
+      }
+      if (executionStartRequested || containerStarted || active.cancelled()) {
+        throw executionFailure(capture, e, active.cancelled());
+      }
       throw new SandboxUnavailableException("Docker runner backend is unavailable", e);
     } finally {
+      setupDeadline.cancel(false);
+      activeExecutions.remove(spec.sandboxSessionId(), active);
       closeQuietly(logStream);
-      if (docker != null && containerId != null) {
-        removeContainerQuietly(docker, containerId);
-      }
-      if (docker != null && loaderContainerId != null) {
-        removeContainerQuietly(docker, loaderContainerId);
-      }
-      if (docker != null && sourceVolume != null) {
-        removeVolumeQuietly(docker, sourceVolume);
-      }
-      closeQuietly(docker);
+      cleanupBounded(docker, containerId, loaderContainerId, sourceVolume);
     }
+  }
+
+  @Override
+  public void cancel(long sandboxSessionId) {
+    ActiveExecution active = activeExecutions.get(sandboxSessionId);
+    if (active != null) {
+      active.cancelForDrain();
+    }
+  }
+
+  static SandboxRunnerExecutionException executionFailure(
+      DockerLogCapture capture,
+      Throwable cause,
+      boolean cancelled) {
+    capture.finish(false);
+    SandboxTerminalStatus status = cancelled
+        ? SandboxTerminalStatus.KILLED
+        : SandboxTerminalStatus.FAILED;
+    return new SandboxRunnerExecutionException(
+        cancelled
+            ? "Sandbox execution was cancelled"
+            : "Docker runner failed after execution was admitted",
+        cause,
+        capture.result(status, cancelled ? -1 : 1, null, null));
   }
 
   static DockerClient createDockerClient() {
@@ -362,44 +449,6 @@ public class DockerRunnerBackend implements RunnerBackend {
     return "devpath-sandbox-" + sessionId + "-" + java.util.UUID.randomUUID();
   }
 
-  private static void appendFrame(
-      Frame frame,
-      SandboxOutputCapture output,
-      Consumer<String> logCallback,
-      Utf8StreamDecoder stdoutDecoder,
-      Utf8StreamDecoder stderrDecoder) {
-    boolean stderr = frame.getStreamType() == StreamType.STDERR;
-    String chunk = (stderr ? stderrDecoder : stdoutDecoder).decode(frame.getPayload());
-    appendDecoded(chunk, stderr, output, logCallback);
-  }
-
-  private static void finishDecoders(
-      SandboxOutputCapture output,
-      Consumer<String> logCallback,
-      Utf8StreamDecoder stdoutDecoder,
-      Utf8StreamDecoder stderrDecoder) {
-    appendDecoded(stdoutDecoder.finish(), false, output, logCallback);
-    appendDecoded(stderrDecoder.finish(), true, output, logCallback);
-  }
-
-  private static void appendDecoded(
-      String chunk,
-      boolean stderr,
-      SandboxOutputCapture output,
-      Consumer<String> logCallback) {
-    String accepted;
-    if (stderr) {
-      accepted = output.appendStderr(chunk);
-    } else {
-      accepted = output.appendStdout(chunk);
-    }
-
-    String line = accepted.stripTrailing();
-    if (!line.isEmpty()) {
-      logCallback.accept(line);
-    }
-  }
-
   private static void killQuietly(DockerClient docker, String containerId) {
     try {
       docker.killContainerCmd(containerId).exec();
@@ -407,9 +456,39 @@ public class DockerRunnerBackend implements RunnerBackend {
     }
   }
 
-  private static void awaitLogs(ResultCallback.Adapter<Frame> logStream) throws InterruptedException {
-    if (logStream != null) {
-      logStream.awaitCompletion(2, TimeUnit.SECONDS);
+  private static boolean awaitLogs(ResultCallback.Adapter<Frame> logStream)
+      throws InterruptedException {
+    return logStream == null || logStream.awaitCompletion(2, TimeUnit.SECONDS);
+  }
+
+  private static void cleanupBounded(
+      DockerClient docker,
+      String containerId,
+      String loaderContainerId,
+      String sourceVolume) {
+    if (docker == null) {
+      return;
+    }
+    Thread cleanup = Thread.ofVirtual().name("sandbox-runner-cleanup").start(() -> {
+      if (containerId != null) {
+        removeContainerQuietly(docker, containerId);
+      }
+      if (loaderContainerId != null) {
+        removeContainerQuietly(docker, loaderContainerId);
+      }
+      if (sourceVolume != null) {
+        removeVolumeQuietly(docker, sourceVolume);
+      }
+      closeQuietly(docker);
+    });
+    try {
+      cleanup.join(5_000L);
+    } catch (InterruptedException interrupted) {
+      // Deployment cancellation must leave the caller able to persist its exact terminal result.
+      Thread.interrupted();
+    }
+    if (cleanup.isAlive()) {
+      closeQuietly(docker);
     }
   }
 
@@ -449,6 +528,93 @@ public class DockerRunnerBackend implements RunnerBackend {
     try {
       closeable.close();
     } catch (Exception ignored) {
+    }
+  }
+
+  private static final class ActiveExecution {
+    private final Thread owner;
+    private final AtomicBoolean cancelled = new AtomicBoolean();
+    private final AtomicBoolean executionStarted = new AtomicBoolean();
+    private final AtomicBoolean setupDeadlineExpired = new AtomicBoolean();
+    private volatile DockerClient docker;
+    private volatile String containerId;
+    private volatile ResultCallback.Adapter<Frame> logStream;
+
+    private ActiveExecution(Thread owner) {
+      this.owner = owner;
+    }
+
+    private void attachDocker(DockerClient value) {
+      docker = value;
+      if (cancelled.get()) {
+        closeQuietly(value);
+      }
+    }
+
+    private void attachContainer(String value) {
+      containerId = value;
+      if (cancelled.get() && value != null) {
+        cancelRemoteAsync();
+      }
+    }
+
+    private void attachLogStream(ResultCallback.Adapter<Frame> value) {
+      logStream = value;
+      if (cancelled.get()) {
+        closeQuietly(value);
+      }
+    }
+
+    private void markExecutionStarted() {
+      executionStarted.set(true);
+    }
+
+    private void cancelForSetupDeadline() {
+      if (executionStarted.get()) {
+        return;
+      }
+      setupDeadlineExpired.set(true);
+      cancel();
+    }
+
+    private void cancelForDrain() {
+      cancel();
+    }
+
+    private void cancel() {
+      if (cancelled.compareAndSet(false, true)) {
+        owner.interrupt();
+        closeQuietly(logStream);
+        cancelRemoteAsync();
+      }
+    }
+
+    private void cancelRemoteAsync() {
+      DockerClient activeDocker = docker;
+      String activeContainerId = containerId;
+      if (activeDocker == null) {
+        return;
+      }
+      Thread.ofVirtual().name("sandbox-runner-cancel").start(() -> {
+        if (activeContainerId != null) {
+          killQuietly(activeDocker, activeContainerId);
+        }
+        closeQuietly(activeDocker);
+      });
+    }
+
+    private void throwIfCancelled() {
+      if (cancelled.get()) {
+        throw new SandboxUnavailableException("Sandbox execution was cancelled");
+      }
+    }
+
+    private boolean cancelled() {
+      return cancelled.get();
+    }
+
+    private boolean setupDeadlineExpired() {
+      return setupDeadlineExpired.get();
     }
   }
 

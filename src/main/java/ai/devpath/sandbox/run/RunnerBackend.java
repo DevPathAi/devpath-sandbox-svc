@@ -16,6 +16,9 @@ public interface RunnerBackend {
 
   boolean isAvailable();
 
+  /** Cancels an admitted remote execution during deployment drain. */
+  default void cancel(long sandboxSessionId) {}
+
   default int reapExpiredContainers(Instant now) {
     return 0;
   }

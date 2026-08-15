@@ -22,6 +22,8 @@ class GracefulShutdownConfigTest {
     assertThat(environment.getProperty(
         "devpath.sandbox.executor.drain-timeout-ms", Long.class)).isEqualTo(75_000L);
     assertThat(environment.getProperty(
+        "devpath.sandbox.executor.active-cutoff-ms", Long.class)).isEqualTo(60_000L);
+    assertThat(environment.getProperty(
         "spring.datasource.hikari.connection-timeout", Long.class)).isEqualTo(4_000L);
     assertThat(environment.getProperty("spring.datasource.hikari.data-source-properties.socketTimeout"))
         .isEqualTo("4");

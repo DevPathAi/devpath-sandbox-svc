@@ -104,6 +104,8 @@ public class SandboxRunService {
       if (result == null) {
         throw new SandboxUnavailableException("Sandbox runner returned no result");
       }
+    } catch (SandboxRunnerExecutionException runnerFailure) {
+      result = runnerFailure.result();
     } catch (RuntimeException runnerFailure) {
       SandboxTerminalStatus status = Thread.currentThread().isInterrupted()
           ? SandboxTerminalStatus.KILLED
@@ -176,6 +178,11 @@ public class SandboxRunService {
       if (claimed.compareAndSet(false, true)) {
         finalizeResult(sessionId, killedResult(), delivery, reservation);
       }
+    }
+
+    @Override
+    public void cancelRunning() {
+      runnerBackend.cancel(sessionId);
     }
   }
 }

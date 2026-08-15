@@ -45,6 +45,10 @@ final class SandboxOutputCapture {
         truncated);
   }
 
+  synchronized void markTruncated() {
+    truncated = true;
+  }
+
   private String append(StringBuilder target, String rawValue) {
     String value = rawValue == null ? "" : rawValue;
     int offset = 0;

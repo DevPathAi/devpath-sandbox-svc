@@ -2,6 +2,7 @@ package ai.devpath.sandbox.run;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -31,6 +32,7 @@ class SandboxRunPersistenceLifecycleTest {
   @Autowired OutboxRepository outbox;
   @Autowired DataSource dataSource;
   @Autowired SandboxRunEventPublisher eventPublisher;
+  @Autowired SandboxInstanceIdentity instanceIdentity;
   @Autowired EntityManager entityManager;
   @Autowired PlatformTransactionManager transactionManager;
 
@@ -165,6 +167,29 @@ class SandboxRunPersistenceLifecycleTest {
   }
 
   @Test
+  void existingOutboxIsAPointOfNoReturnEvenForTheTerminalFallback() {
+    SandboxSession allocated = persistence.allocate(
+        506L, new SandboxRunRequest("print('active')", "PYTHON", null, null));
+    persistence.markRunning(allocated.getId());
+    assertThat(eventPublisher.publishSubmitted(
+        allocated.getId(), allocated.getUserId(), allocated.getLanguage(), allocated.getContentId()))
+        .isTrue();
+    var pointOfNoReturn = terminalOutbox(allocated.getId());
+
+    assertThrows(IllegalStateException.class, () -> persistence.finishWithoutEvent(
+        allocated.getId(),
+        new RunResult(SandboxTerminalStatus.COMPLETED, 0, "must-not-stick", "", null, null, false)));
+
+    SandboxSession unchanged = sessions.findById(allocated.getId()).orElseThrow();
+    var unchangedEvent = terminalOutbox(allocated.getId());
+    assertThat(unchanged.getStatus()).isEqualTo("RUNNING");
+    assertThat(unchanged.getStdout()).isNull();
+    assertThat(unchangedEvent.getId()).isEqualTo(pointOfNoReturn.getId());
+    assertThat(unchangedEvent.getPayload()).isEqualTo(pointOfNoReturn.getPayload());
+    assertThat(unchangedEvent.getCreatedAt()).isEqualTo(pointOfNoReturn.getCreatedAt());
+  }
+
+  @Test
   void staleAllocatingAndRunningSessionsAreReconciledToExplicitTerminals() {
     long allocatingId = saveStale(601L, "ALLOCATING");
     long runningId = saveStale(602L, "RUNNING");
@@ -283,6 +308,40 @@ class SandboxRunPersistenceLifecycleTest {
 
     assertThat(firstPass).isZero();
     assertThat(reconciled).isEqualTo(1);
+    assertThat(sessions.findById(id).orElseThrow().getStatus()).isEqualTo("KILLED");
+  }
+
+  @Test
+  void expiredLeaseBecomesTerminalWithinTheThirtyFiveSecondStaleSlo() {
+    Instant leaseExpiredAt = Instant.parse("2026-08-16T00:00:00Z");
+    SandboxSession session = new SandboxSession();
+    session.setUserId(610L);
+    session.setLanguage("PYTHON");
+    session.setSubmittedCode("lost-process");
+    session.setStatus("RUNNING");
+    session.setOwnerInstance("dead-process");
+    session.setLeaseExpiresAt(leaseExpiredAt);
+    long id = sessions.saveAndFlush(session).getId();
+    SandboxRunPersistenceService repairPod = persistenceFor(
+        new SandboxInstanceIdentity(
+            "repair-pod", UUID.fromString("88888888-8888-8888-8888-888888888888")),
+        eventPublisher);
+    TransactionTemplate transactions = new TransactionTemplate(transactionManager);
+
+    int firstPass = transactions.execute(ignored -> repairPod.reconcileExpiredAs(
+        "repair-pod:88888888-8888-8888-8888-888888888888",
+        leaseExpiredAt.plusSeconds(5), leaseExpiredAt.minusSeconds(35), 25));
+    assertThat(firstPass).isZero();
+    int beforeDeadline = transactions.execute(ignored -> repairPod.reconcileExpiredAs(
+        "repair-pod:88888888-8888-8888-8888-888888888888",
+        leaseExpiredAt.plusSeconds(34), leaseExpiredAt.minusSeconds(35), 25));
+    assertThat(beforeDeadline).isZero();
+    assertThat(sessions.findById(id).orElseThrow().getStatus()).isEqualTo("RUNNING");
+
+    int atDeadline = transactions.execute(ignored -> repairPod.reconcileExpiredAs(
+        "repair-pod:88888888-8888-8888-8888-888888888888",
+        leaseExpiredAt.plusSeconds(35), leaseExpiredAt.minusSeconds(35), 25));
+    assertThat(atDeadline).isEqualTo(1);
     assertThat(sessions.findById(id).orElseThrow().getStatus()).isEqualTo("KILLED");
   }
 
@@ -452,6 +511,150 @@ class SandboxRunPersistenceLifecycleTest {
     }
   }
 
+  @Test
+  void repairLockWinsAndMakesPendingAndPublishedInferredEventImmutable() throws Exception {
+    InferredRun inferred = createInferredRun(630L);
+    CountDownLatch repairHasRow = new CountDownLatch(1);
+    CountDownLatch allowRepairToPublish = new CountDownLatch(1);
+    SandboxRunEventPublisher gatedPublisher = mock(SandboxRunEventPublisher.class);
+    doAnswer(invocation -> {
+      repairHasRow.countDown();
+      if (!allowRepairToPublish.await(2, TimeUnit.SECONDS)) {
+        throw new IllegalStateException("repair publish gate timed out");
+      }
+      return eventPublisher.publishSubmitted(
+          invocation.getArgument(0),
+          invocation.getArgument(1),
+          invocation.getArgument(2),
+          invocation.getArgument(3));
+    }).when(gatedPublisher).publishSubmitted(
+        org.mockito.ArgumentMatchers.anyLong(),
+        org.mockito.ArgumentMatchers.anyLong(),
+        org.mockito.ArgumentMatchers.anyString(),
+        org.mockito.ArgumentMatchers.nullable(Long.class));
+    SandboxRunPersistenceService repairPod = persistenceFor(
+        new SandboxInstanceIdentity(
+            "pod-repair", UUID.fromString("55555555-5555-5555-5555-555555555555")),
+        gatedPublisher);
+    TransactionTemplate transactions = new TransactionTemplate(transactionManager);
+    RunResult exact = new RunResult(
+        SandboxTerminalStatus.COMPLETED, 0, "exact-after-repair", "", 11L, 22, false);
+
+    try (var callers = Executors.newFixedThreadPool(2)) {
+      var repair = callers.submit(() -> transactions.execute(ignored ->
+          repairPod.repairMissingTerminalEvents(25, inferred.publishCutoff())));
+      assertThat(repairHasRow.await(1, TimeUnit.SECONDS)).isTrue();
+
+      CountDownLatch exactCalling = new CountDownLatch(1);
+      var exactRetry = callers.submit(() -> {
+        exactCalling.countDown();
+        return persistence.finish(inferred.sessionId(), exact);
+      });
+      assertThat(exactCalling.await(1, TimeUnit.SECONDS)).isTrue();
+      Thread.sleep(100L);
+      assertThat(exactRetry.isDone()).isFalse();
+
+      allowRepairToPublish.countDown();
+      assertThat(repair.get(2, TimeUnit.SECONDS)).isEqualTo(1);
+      SandboxSession canonical = exactRetry.get(2, TimeUnit.SECONDS);
+      assertThat(canonical.getStatus()).isEqualTo("KILLED");
+      assertThat(canonical.getTerminalSource()).isEqualTo("RECONCILER");
+    }
+
+    var pendingEvent = terminalOutbox(inferred.sessionId());
+    Long eventId = pendingEvent.getId();
+    Instant eventCreatedAt = pendingEvent.getCreatedAt();
+    String eventPayload = pendingEvent.getPayload();
+    Instant inferredFinishedAt = sessions.findById(inferred.sessionId()).orElseThrow().getFinishedAt();
+
+    SandboxTerminalFinalizer finalizer = new SandboxTerminalFinalizer(
+        persistence,
+        new io.micrometer.core.instrument.simple.SimpleMeterRegistry(),
+        1,
+        1,
+        SandboxTerminalFinalizer.RESULT_RESERVATION_BYTES,
+        java.time.Duration.ofSeconds(1));
+    SandboxSession pendingCanonical = finalizer.finish(inferred.sessionId(), exact);
+    assertThat(pendingCanonical.getStatus()).isEqualTo("KILLED");
+    assertThat(finalizer.pendingCount()).isZero();
+    assertThat(finalizer.hasCapacity()).isTrue();
+
+    pendingEvent.setPublishedAt(Instant.now());
+    outbox.saveAndFlush(pendingEvent);
+    SandboxSession publishedCanonical = persistence.finish(inferred.sessionId(), exact);
+
+    SandboxSession unchanged = sessions.findById(inferred.sessionId()).orElseThrow();
+    var unchangedEvent = terminalOutbox(inferred.sessionId());
+    assertThat(unchanged.getStatus()).isEqualTo("KILLED");
+    assertThat(unchanged.getTerminalSource()).isEqualTo("RECONCILER");
+    assertThat(unchanged.getFinishedAt()).isEqualTo(inferredFinishedAt);
+    assertThat(publishedCanonical.getStatus()).isEqualTo("KILLED");
+    assertThat(unchangedEvent.getId()).isEqualTo(eventId);
+    assertThat(unchangedEvent.getCreatedAt()).isEqualTo(eventCreatedAt);
+    assertThat(unchangedEvent.getPayload()).isEqualTo(eventPayload);
+    assertThat(outbox.findAll())
+        .filteredOn(entry -> entry.getAggregateId().equals(String.valueOf(inferred.sessionId())))
+        .hasSize(1);
+  }
+
+  @Test
+  void exactLockWinsAndRepairSkipsWithoutPublishingInferredEvent() throws Exception {
+    InferredRun inferred = createInferredRun(631L);
+    CountDownLatch exactHasRow = new CountDownLatch(1);
+    CountDownLatch allowExactToPublish = new CountDownLatch(1);
+    SandboxRunEventPublisher gatedPublisher = mock(SandboxRunEventPublisher.class);
+    doAnswer(invocation -> {
+      exactHasRow.countDown();
+      if (!allowExactToPublish.await(2, TimeUnit.SECONDS)) {
+        throw new IllegalStateException("exact publish gate timed out");
+      }
+      return eventPublisher.publishSubmitted(
+          invocation.getArgument(0),
+          invocation.getArgument(1),
+          invocation.getArgument(2),
+          invocation.getArgument(3));
+    }).when(gatedPublisher).publishSubmitted(
+        org.mockito.ArgumentMatchers.anyLong(),
+        org.mockito.ArgumentMatchers.anyLong(),
+        org.mockito.ArgumentMatchers.anyString(),
+        org.mockito.ArgumentMatchers.nullable(Long.class));
+    SandboxRunPersistenceService exactOwner = persistenceFor(instanceIdentity, gatedPublisher);
+    SandboxRunPersistenceService repairPod = persistenceFor(
+        new SandboxInstanceIdentity(
+            "pod-repair", UUID.fromString("66666666-6666-6666-6666-666666666666")),
+        eventPublisher);
+    TransactionTemplate transactions = new TransactionTemplate(transactionManager);
+    RunResult exact = new RunResult(
+        SandboxTerminalStatus.TIMED_OUT, -1, "exact-partial", "deadline", 30_000L, 64, true);
+
+    try (var callers = Executors.newFixedThreadPool(2)) {
+      var exactRetry = callers.submit(() -> transactions.execute(ignored ->
+          exactOwner.finish(inferred.sessionId(), exact)));
+      assertThat(exactHasRow.await(1, TimeUnit.SECONDS)).isTrue();
+
+      int repaired;
+      try {
+        repaired = transactions.execute(ignored ->
+            repairPod.repairMissingTerminalEvents(25, inferred.publishCutoff()));
+      } finally {
+        allowExactToPublish.countDown();
+      }
+      assertThat(repaired).isZero();
+      SandboxSession terminal = exactRetry.get(2, TimeUnit.SECONDS);
+      assertThat(terminal.getStatus()).isEqualTo("TIMED_OUT");
+      assertThat(terminal.getTerminalSource()).isEqualTo("RUNNER");
+    }
+
+    SandboxSession terminal = sessions.findById(inferred.sessionId()).orElseThrow();
+    assertThat(terminal.getStatus()).isEqualTo("TIMED_OUT");
+    assertThat(terminal.getStdout()).isEqualTo("exact-partial");
+    assertThat(terminal.getStderr()).isEqualTo("deadline");
+    assertThat(terminal.isOutputTruncated()).isTrue();
+    assertThat(outbox.findAll())
+        .filteredOn(entry -> entry.getAggregateId().equals(String.valueOf(inferred.sessionId())))
+        .hasSize(1);
+  }
+
   private long saveStale(long userId, String status) {
     SandboxSession session = new SandboxSession();
     session.setUserId(userId);
@@ -462,4 +665,43 @@ class SandboxRunPersistenceLifecycleTest {
     session.setUpdatedAt(Instant.now().minusSeconds(60));
     return sessions.saveAndFlush(session).getId();
   }
+
+  private InferredRun createInferredRun(long userId) {
+    SandboxSession allocated = persistence.allocate(
+        userId, new SandboxRunRequest("run", "PYTHON", null, null));
+    persistence.markRunning(allocated.getId());
+    SandboxSession expired = sessions.findById(allocated.getId()).orElseThrow();
+    expired.setLeaseExpiresAt(Instant.now().minusSeconds(1));
+    sessions.saveAndFlush(expired);
+    Instant claimedAt = Instant.now();
+    SandboxRunPersistenceService repairPod = persistenceFor(
+        new SandboxInstanceIdentity(
+            "pod-claim", UUID.fromString("77777777-7777-7777-7777-777777777777")),
+        eventPublisher);
+    TransactionTemplate transactions = new TransactionTemplate(transactionManager);
+    int claimed = transactions.execute(ignored -> repairPod.reconcileExpired(
+        claimedAt, claimedAt.minusSeconds(35), 25));
+    assertThat(claimed).isZero();
+    Instant inferredAt = claimedAt.plusSeconds(31);
+    int reconciled = transactions.execute(ignored -> repairPod.reconcileExpired(
+        inferredAt, claimedAt.minusSeconds(35), 25));
+    assertThat(reconciled).isEqualTo(1);
+    return new InferredRun(allocated.getId(), inferredAt.plusSeconds(1));
+  }
+
+  private SandboxRunPersistenceService persistenceFor(
+      SandboxInstanceIdentity identity,
+      SandboxRunEventPublisher publisher) {
+    return new SandboxRunPersistenceService(
+        sessions, publisher, entityManager, identity, 20_000L, 30_000L, 30_000L);
+  }
+
+  private ai.devpath.sandbox.outbox.OutboxEntry terminalOutbox(long sessionId) {
+    return outbox.findAll().stream()
+        .filter(entry -> entry.getAggregateId().equals(String.valueOf(sessionId)))
+        .findFirst()
+        .orElseThrow();
+  }
+
+  private record InferredRun(long sessionId, Instant publishCutoff) {}
 }

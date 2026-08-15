@@ -28,6 +28,7 @@ devpath:
     executor:
       parallelism: ${SANDBOX_PARALLELISM:4}
       queue-capacity: ${SANDBOX_QUEUE_CAPACITY:4}
+      active-cutoff-ms: ${SANDBOX_ACTIVE_CUTOFF_MS:60000}
       drain-timeout-ms: ${SANDBOX_DRAIN_TIMEOUT_MS:75000}
     reconcile:
       stale-after-ms: ${SANDBOX_STALE_AFTER_MS:35000}

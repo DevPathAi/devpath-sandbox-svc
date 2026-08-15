@@ -111,6 +111,41 @@ class SandboxRunExecutorTest {
     release.countDown();
   }
 
+  @Test
+  void shutdownCancelsRunningWorkAtTheActiveCutoffAndKeepsATerminalTailBudget()
+      throws Exception {
+    executor = new SandboxRunExecutor(1, 0, 300, 100, new SimpleMeterRegistry());
+    CountDownLatch started = new CountDownLatch(1);
+    CountDownLatch remoteCancelled = new CountDownLatch(1);
+    CountDownLatch terminalPersisted = new CountDownLatch(1);
+    executor.submit(9L, () -> new SandboxRunExecutor.CancelableWork() {
+      @Override
+      public void run() {
+        started.countDown();
+        try {
+          remoteCancelled.await();
+          Thread.sleep(50L);
+          terminalPersisted.countDown();
+        } catch (InterruptedException interrupted) {
+          Thread.currentThread().interrupt();
+        }
+      }
+
+      @Override public void cancelBeforeStart() {}
+
+      @Override public void cancelRunning() { remoteCancelled.countDown(); }
+    });
+    assertThat(started.await(1, TimeUnit.SECONDS)).isTrue();
+
+    long startedAt = System.nanoTime();
+    executor.stopForTest(Duration.ofMillis(300));
+    long elapsedMs = (System.nanoTime() - startedAt) / 1_000_000;
+
+    assertThat(remoteCancelled.getCount()).isZero();
+    assertThat(terminalPersisted.getCount()).isZero();
+    assertThat(elapsedMs).isBetween(80L, 290L);
+  }
+
   private static Runnable blockingWork(CountDownLatch started, CountDownLatch release) {
     return () -> {
       started.countDown();

@@ -31,4 +31,19 @@ public interface OutboxRepository extends JpaRepository<OutboxEntry, Long> {
       @Param("payload") String payload,
       @Param("createdAt") java.time.Instant createdAt,
       @Param("dedupeKey") String dedupeKey);
+
+  @Query(value = """
+      SELECT EXISTS (
+        SELECT 1
+        FROM outbox event
+        WHERE event.dedupe_key = 'sandbox.run.submitted:' || :aggregateId
+           OR (
+             event.dedupe_key IS NULL
+             AND event.aggregate_type = 'sandbox_session'
+             AND event.aggregate_id = :aggregateId
+             AND event.event_type = 'sandbox.run.submitted'
+           )
+      )
+      """, nativeQuery = true)
+  boolean existsSandboxTerminal(@Param("aggregateId") String aggregateId);
 }

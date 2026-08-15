@@ -57,13 +57,30 @@ public interface SandboxSessionRepository extends JpaRepository<SandboxSession, 
       @Param("leaseExpiresAt") java.time.Instant leaseExpiresAt);
 
   @Query(value = """
+      SELECT count(*)
+      FROM sandbox_sessions
+      WHERE status IN ('ALLOCATING', 'RUNNING')
+        AND (
+          (lease_expires_at IS NOT NULL AND lease_expires_at <= :now)
+          OR
+          (lease_expires_at IS NULL AND updated_at < :legacyCutoff)
+        )
+      """, nativeQuery = true)
+  long countExpiredActive(
+      @Param("now") java.time.Instant now,
+      @Param("legacyCutoff") java.time.Instant legacyCutoff);
+
+  @Query(value = """
       SELECT session.*
       FROM sandbox_sessions session
       WHERE session.status IN ('COMPLETED', 'FAILED', 'KILLED', 'TIMED_OUT')
         AND (
           session.terminal_source IS NULL
           OR session.terminal_source <> 'RECONCILER'
-          OR session.reconciliation_started_at <= :reconciliationPublishCutoff
+          OR (
+            session.reconciliation_token IS NOT NULL
+            AND session.reconciliation_started_at <= :reconciliationPublishCutoff
+          )
         )
         AND NOT EXISTS (
           SELECT 1
@@ -78,6 +95,7 @@ public interface SandboxSessionRepository extends JpaRepository<SandboxSession, 
         )
       ORDER BY session.finished_at, session.id
       LIMIT :batchSize
+      FOR UPDATE OF session SKIP LOCKED
       """, nativeQuery = true)
   List<SandboxSession> findTerminalWithoutOutbox(
       @Param("reconciliationPublishCutoff") java.time.Instant reconciliationPublishCutoff,

@@ -9,7 +9,7 @@ import org.junit.jupiter.api.Test;
 class CiWorkflowContractTest {
 
   private static final String FINAL_SHARED =
-      "d3cf41faf21d00b815b398a7492af5506390151a";
+      "96a5cdb9d95689759afb229b4d1e29b9bd221793";
   private static final String ET8_SHARED =
       "2b03c38934fdd19332da59107e4330a3af92d078";
   private static final String HISTORICAL_SHARED =

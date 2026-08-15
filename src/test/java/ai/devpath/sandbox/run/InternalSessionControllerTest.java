@@ -3,8 +3,11 @@ package ai.devpath.sandbox.run;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.time.Instant;
+import java.util.Arrays;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -12,6 +15,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.data.jpa.repository.Query;
 
 @SpringBootTest
 @AutoConfigureMockMvc
@@ -121,6 +125,83 @@ class InternalSessionControllerTest {
             .param("limit", "999")))
         .andExpect(status().isOk())
         .andExpect(jsonPath("$.length()").value(20));
+  }
+
+  @Test
+  void recentMetadataReturnsOnlyLanguageAndStatusWithoutHydratingSecrets() throws Exception {
+    long userId = 7010L;
+    SandboxSession secret = new SandboxSession();
+    secret.setUserId(userId);
+    secret.setLanguage("JAVA");
+    secret.setSubmittedCode("SECRET_CODE");
+    secret.setStdout("SECRET_STDOUT");
+    secret.setStderr("SECRET_STDERR");
+    secret.setContentId(91L);
+    secret.setCodeBlockId(92L);
+    secret.setExitCode(0);
+    secret.setOutputTruncated(true);
+    secret.setStatus("COMPLETED");
+    secret.setStartedAt(Instant.parse("2026-06-24T12:00:00Z"));
+    sessions.save(secret);
+
+    String body = mvc.perform(internal(get("/internal/sandbox/sessions/recent/metadata")
+            .param("userId", String.valueOf(userId))))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.length()").value(1))
+        .andExpect(jsonPath("$[0].length()").value(2))
+        .andExpect(jsonPath("$[0].language").value("JAVA"))
+        .andExpect(jsonPath("$[0].status").value("COMPLETED"))
+        .andExpect(jsonPath("$[0].submittedCode").doesNotExist())
+        .andExpect(jsonPath("$[0].stdout").doesNotExist())
+        .andExpect(jsonPath("$[0].stderr").doesNotExist())
+        .andExpect(jsonPath("$[0].id").doesNotExist())
+        .andExpect(jsonPath("$[0].userId").doesNotExist())
+        .andExpect(jsonPath("$[0].contentId").doesNotExist())
+        .andExpect(jsonPath("$[0].codeBlockId").doesNotExist())
+        .andExpect(jsonPath("$[0].exitCode").doesNotExist())
+        .andExpect(jsonPath("$[0].outputTruncated").doesNotExist())
+        .andReturn().getResponse().getContentAsString();
+
+    assertFalse(body.contains("SECRET_CODE"));
+    assertFalse(body.contains("SECRET_STDOUT"));
+    assertFalse(body.contains("SECRET_STDERR"));
+  }
+
+  @Test
+  void recentMetadataClampsLimitAndRequiresWorkloadToken() throws Exception {
+    long userId = 7011L;
+    for (int i = 0; i < 22; i++) {
+      saveSession(userId, "SECRET_" + i,
+          Instant.parse("2026-06-24T10:00:00Z").plusSeconds(i));
+    }
+
+    mvc.perform(internal(get("/internal/sandbox/sessions/recent/metadata")
+            .param("userId", String.valueOf(userId))
+            .param("limit", "999")))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.length()").value(20))
+        .andExpect(jsonPath("$[0].length()").value(2));
+
+    mvc.perform(get("/internal/sandbox/sessions/recent/metadata")
+            .param("userId", String.valueOf(userId)))
+        .andExpect(status().isUnauthorized());
+  }
+
+  @Test
+  void recentMetadataRepositoryUsesAnExplicitTwoColumnProjection() {
+    var projectionMethod = Arrays.stream(SandboxSessionRepository.class.getMethods())
+        .filter(method -> method.getName().equals("findRecentMetadataByUserId"))
+        .findFirst();
+
+    assertTrue(projectionMethod.isPresent(), "dedicated metadata projection query is required");
+    Query query = projectionMethod.orElseThrow().getAnnotation(Query.class);
+    assertTrue(query != null, "metadata projection must declare an explicit query");
+    String statement = query.value();
+    assertTrue(statement.contains("SandboxSessionMetadata(session.language, session.status)"));
+    assertFalse(statement.contains("select session "));
+    assertFalse(statement.contains("submittedCode"));
+    assertFalse(statement.contains("stdout"));
+    assertFalse(statement.contains("stderr"));
   }
 
   @Test

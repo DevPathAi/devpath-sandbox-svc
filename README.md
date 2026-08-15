@@ -47,6 +47,17 @@ SSE 연결 종료는 실행 상태가 아닙니다.
 출력은 stdout/stderr 합산 UTF-8 256 KiB, SSE 이벤트당 16 KiB로 제한됩니다. 실행과 terminal
 outbox 저장은 SSE 전송과 독립적이며, 느리거나 끊긴 클라이언트는 실행을 취소하지 않습니다.
 
+## Mentor 최근 실행 metadata 계약
+
+`GET /internal/sandbox/sessions/recent/metadata`는 workload token을 요구하며 응답 항목을
+정확히 `language`, `status` 두 필드로 제한합니다. 조회도 같은 두 DB 컬럼만 projection하여
+제출 코드와 stdout/stderr를 LCS 경계로 보내지 않습니다. 기존 `/recent`는 AI 등 기존 소비자의
+full-session 계약이므로 응답을 축소하지 않습니다.
+
+배포는 Sandbox producer를 먼저 올리고 새 endpoint의 readiness를 확인한 다음 LCS consumer를
+전환합니다. 구 consumer가 모두 전환되기 전에는 `/recent`를 제거하지 않으며, LCS는 새 endpoint
+실패 시 구 raw endpoint로 fallback하지 않습니다.
+
 ## 개발 규칙
 
 - Git 규칙: [documents/09_Git_규칙_정의서](https://github.com/DevPathAi/documents/blob/main/09_Git_규칙_정의서.md)

@@ -15,6 +15,16 @@ public interface SandboxSessionRepository extends JpaRepository<SandboxSession, 
   /** 사용자별 최근 실행(started_at DESC). limit은 Pageable로 적용(인덱스 idx_sandbox_user_started 정합). */
   List<SandboxSession> findByUserIdOrderByStartedAtDesc(long userId, Pageable pageable);
 
+  /** Mentor context용 최소 projection. 코드·출력·식별자 컬럼은 조회하지 않는다. */
+  @Query("""
+      select new ai.devpath.sandbox.run.SandboxSessionMetadata(session.language, session.status)
+      from SandboxSession session
+      where session.userId = :userId
+      order by session.startedAt desc
+      """)
+  List<SandboxSessionMetadata> findRecentMetadataByUserId(
+      @Param("userId") long userId, Pageable pageable);
+
   Optional<SandboxSession> findByIdAndUserId(long id, long userId);
 
   boolean existsByUserIdAndStatusIn(long userId, List<String> statuses);

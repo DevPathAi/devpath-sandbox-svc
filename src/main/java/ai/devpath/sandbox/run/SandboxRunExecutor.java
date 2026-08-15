@@ -4,6 +4,7 @@ import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
@@ -29,6 +30,10 @@ import org.springframework.stereotype.Component;
 @Component
 public class SandboxRunExecutor implements SmartLifecycle {
 
+  interface CancelableWork extends Runnable {
+    void cancelBeforeStart();
+  }
+
   private final ThreadPoolExecutor executor;
   private final Semaphore capacity;
   private final Set<Long> activeUsers = ConcurrentHashMap.newKeySet();
@@ -44,9 +49,9 @@ public class SandboxRunExecutor implements SmartLifecycle {
   public SandboxRunExecutor(
       @Value("${devpath.sandbox.executor.parallelism:4}") int parallelism,
       @Value("${devpath.sandbox.executor.queue-capacity:4}") int queueCapacity,
-      @Value("${devpath.sandbox.executor.drain-timeout-ms:90000}") long drainTimeoutMs,
+      @Value("${devpath.sandbox.executor.drain-timeout-ms:75000}") long drainTimeoutMs,
       MeterRegistry registry) {
-    if (parallelism < 1 || queueCapacity < 0) {
+    if (parallelism < 1 || queueCapacity < 0 || drainTimeoutMs < 1) {
       throw new IllegalArgumentException("Sandbox executor capacity must be positive");
     }
     this.drainTimeoutMs = drainTimeoutMs;
@@ -184,6 +189,7 @@ public class SandboxRunExecutor implements SmartLifecycle {
   }
 
   private void drain(Duration timeout) {
+    long deadlineNanos = System.nanoTime() + timeout.toNanos();
     lifecycleLock.writeLock().lock();
     try {
       if (!running.getAndSet(false)) {
@@ -195,24 +201,56 @@ public class SandboxRunExecutor implements SmartLifecycle {
     }
 
     try {
-      if (!executor.awaitTermination(timeout.toMillis(), TimeUnit.MILLISECONDS)) {
+      List<Runnable> queued = new ArrayList<>();
+      executor.getQueue().drainTo(queued);
+      cancelQueuedInParallel(queued, deadlineNanos);
+
+      long remainingMs = remainingMillis(deadlineNanos);
+      if (!executor.awaitTermination(remainingMs, TimeUnit.MILLISECONDS)) {
         List<Runnable> neverStarted = executor.shutdownNow();
-        neverStarted.forEach(task -> {
-          if (task instanceof WorkItem workItem) {
-            workItem.cancelBeforeStart();
-          }
-        });
-        executor.awaitTermination(Math.min(timeout.toMillis(), 5_000L), TimeUnit.MILLISECONDS);
+        cancelQueuedInParallel(neverStarted, deadlineNanos);
+        long finalWaitMs = remainingMillis(deadlineNanos);
+        if (finalWaitMs > 0) {
+          executor.awaitTermination(finalWaitMs, TimeUnit.MILLISECONDS);
+        }
       }
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
       List<Runnable> neverStarted = executor.shutdownNow();
-      neverStarted.forEach(task -> {
-        if (task instanceof WorkItem workItem) {
-          workItem.cancelBeforeStart();
+      cancelQueuedInParallel(neverStarted, deadlineNanos);
+    }
+  }
+
+  private static void cancelQueuedInParallel(List<Runnable> queued, long deadlineNanos) {
+    if (queued.isEmpty()) {
+      return;
+    }
+    java.util.concurrent.CountDownLatch finished =
+        new java.util.concurrent.CountDownLatch(queued.size());
+    for (Runnable task : queued) {
+      Thread.ofVirtual().name("sandbox-queued-cancel").start(() -> {
+        try {
+          if (task instanceof SandboxRunExecutor.WorkItem workItem) {
+            workItem.cancelBeforeStart();
+          }
+        } finally {
+          finished.countDown();
         }
       });
     }
+    try {
+      finished.await(remainingMillis(deadlineNanos), TimeUnit.MILLISECONDS);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+    }
+  }
+
+  private static long remainingMillis(long deadlineNanos) {
+    long remainingNanos = deadlineNanos - System.nanoTime();
+    if (remainingNanos <= 0) {
+      return 0L;
+    }
+    return Math.max(1L, TimeUnit.NANOSECONDS.toMillis(remainingNanos));
   }
 
   private void release(long userId) {
@@ -232,6 +270,10 @@ public class SandboxRunExecutor implements SmartLifecycle {
 
     @Override
     public void run() {
+      if (!running.get()) {
+        cancelBeforeStart();
+        return;
+      }
       try {
         delegate.run();
       } finally {
@@ -240,7 +282,13 @@ public class SandboxRunExecutor implements SmartLifecycle {
     }
 
     private void cancelBeforeStart() {
-      releaseOnce();
+      try {
+        if (delegate instanceof CancelableWork cancelable) {
+          cancelable.cancelBeforeStart();
+        }
+      } finally {
+        releaseOnce();
+      }
     }
 
     private void releaseOnce() {

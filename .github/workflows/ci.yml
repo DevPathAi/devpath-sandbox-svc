@@ -31,13 +31,28 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: DevPathAi/devpath-shared
-          ref: d26a623c2cc7c3ddbb4e399355f3e5bb604076ab
+          ref: 2b03c38934fdd19332da59107e4330a3af92d078
           path: .ci/devpath-shared
+      - name: Checkout historical published migration lineage
+        uses: actions/checkout@v6
+        with:
+          repository: DevPathAi/devpath-shared
+          ref: 78e2c6150644f81eff9af9664253ff0b9039f927
+          path: .ci/devpath-shared-history
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 21
       - uses: gradle/actions/setup-gradle@v6
+      - name: Validate historical lineage then migrate in place to the final contract
+        run: ./gradlew test --tests "ai.devpath.sandbox.SharedMigrationUpgradePathTest"
+        env:
+          HISTORICAL_SHARED_MIGRATIONS: ${{ github.workspace }}/.ci/devpath-shared-history/src/main/resources/db/migration
+          DB_URL: jdbc:postgresql://localhost:5432/devpath
+          DB_USER: devpath
+          DB_PASSWORD: localdev
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - run: ./gradlew build "-Dgroups=!docker"
         env:
           DB_URL: jdbc:postgresql://localhost:5432/devpath
@@ -68,7 +83,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: DevPathAi/devpath-shared
-          ref: d26a623c2cc7c3ddbb4e399355f3e5bb604076ab
+          ref: 2b03c38934fdd19332da59107e4330a3af92d078
           path: .ci/devpath-shared
       - uses: actions/setup-java@v5
         with:

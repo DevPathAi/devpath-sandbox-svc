@@ -28,4 +28,24 @@ class SandboxRunnerHealthIndicatorTest {
     assertThat(health.health().getStatus()).isEqualTo(Status.UP);
     verify(backend).isAvailable();
   }
+
+  @Test
+  void readinessFailsClosedWhileTerminalResultHeadroomIsExhaustedAndRecovers() {
+    RunnerBackend backend = mock(RunnerBackend.class);
+    when(backend.isAvailable()).thenReturn(true);
+    SandboxTerminalFinalizer finalizer = new SandboxTerminalFinalizer(
+        mock(SandboxRunPersistenceService.class), new SimpleMeterRegistry(), 1, 1,
+        SandboxTerminalFinalizer.RESULT_RESERVATION_BYTES, java.time.Duration.ofSeconds(1));
+    SandboxRunnerHealthIndicator health =
+        new SandboxRunnerHealthIndicator(backend, finalizer, new SimpleMeterRegistry());
+    health.refresh();
+
+    var reservation = finalizer.reserve();
+
+    assertThat(health.isAvailable()).isFalse();
+    assertThat(health.health().getStatus()).isEqualTo(Status.DOWN);
+    reservation.close();
+    assertThat(health.isAvailable()).isTrue();
+    assertThat(health.health().getStatus()).isEqualTo(Status.UP);
+  }
 }

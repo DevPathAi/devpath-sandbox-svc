@@ -2,9 +2,13 @@ package ai.devpath.sandbox.run;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 import ai.devpath.sandbox.outbox.OutboxRepository;
+import jakarta.persistence.EntityManager;
 import java.time.Instant;
+import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -15,6 +19,8 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 @SpringBootTest
 @ActiveProfiles("test")
@@ -24,6 +30,9 @@ class SandboxRunPersistenceLifecycleTest {
   @Autowired SandboxSessionRepository sessions;
   @Autowired OutboxRepository outbox;
   @Autowired DataSource dataSource;
+  @Autowired SandboxRunEventPublisher eventPublisher;
+  @Autowired EntityManager entityManager;
+  @Autowired PlatformTransactionManager transactionManager;
 
   @BeforeEach
   void cleanup() {
@@ -159,12 +168,35 @@ class SandboxRunPersistenceLifecycleTest {
   void staleAllocatingAndRunningSessionsAreReconciledToExplicitTerminals() {
     long allocatingId = saveStale(601L, "ALLOCATING");
     long runningId = saveStale(602L, "RUNNING");
+    Instant firstClaimAt = Instant.now();
 
-    int reconciled = persistence.reconcileStale(Instant.now().minusSeconds(35));
+    int firstPass = persistence.reconcileExpiredAs(
+        "other-pod:11111111-1111-1111-1111-111111111111",
+        firstClaimAt,
+        firstClaimAt.minusSeconds(35),
+        100);
+
+    assertThat(firstPass).isZero();
+    assertThat(sessions.findById(allocatingId).orElseThrow().getStatus()).isEqualTo("ALLOCATING");
+    assertThat(sessions.findById(runningId).orElseThrow().getStatus()).isEqualTo("RUNNING");
+    assertThat(outbox.findTop100ByPublishedAtIsNullOrderByCreatedAtAsc()).isEmpty();
+
+    int reconciled = persistence.reconcileExpiredAs(
+        "other-pod:11111111-1111-1111-1111-111111111111",
+        firstClaimAt.plusSeconds(31),
+        firstClaimAt.minusSeconds(35),
+        100);
 
     assertThat(reconciled).isEqualTo(2);
     assertThat(sessions.findById(allocatingId).orElseThrow().getStatus()).isEqualTo("FAILED");
     assertThat(sessions.findById(runningId).orElseThrow().getStatus()).isEqualTo("KILLED");
+    assertThat(sessions.findById(runningId).orElseThrow().getTerminalSource())
+        .isEqualTo("RECONCILER");
+    assertThat(outbox.findTop100ByPublishedAtIsNullOrderByCreatedAtAsc()).isEmpty();
+    assertThat(persistence.repairMissingTerminalEvents(
+        100, firstClaimAt.plusSeconds(30))).isZero();
+    assertThat(persistence.repairMissingTerminalEvents(
+        100, firstClaimAt.plusSeconds(62))).isEqualTo(2);
     assertThat(outbox.findTop100ByPublishedAtIsNullOrderByCreatedAtAsc()).hasSize(2);
   }
 
@@ -241,11 +273,67 @@ class SandboxRunPersistenceLifecycleTest {
     session.setUpdatedAt(Instant.now());
     long id = sessions.saveAndFlush(session).getId();
 
-    int reconciled = persistence.reconcileExpired(
-        Instant.now(), Instant.now().minusSeconds(35), 25);
+    Instant firstClaimAt = Instant.now();
+    int firstPass = persistence.reconcileExpiredAs(
+        "recovery-pod:22222222-2222-2222-2222-222222222222",
+        firstClaimAt, firstClaimAt.minusSeconds(35), 25);
+    int reconciled = persistence.reconcileExpiredAs(
+        "recovery-pod:22222222-2222-2222-2222-222222222222",
+        firstClaimAt.plusSeconds(31), firstClaimAt.minusSeconds(35), 25);
 
+    assertThat(firstPass).isZero();
     assertThat(reconciled).isEqualTo(1);
     assertThat(sessions.findById(id).orElseThrow().getStatus()).isEqualTo("KILLED");
+  }
+
+  @Test
+  void samePodRestartGetsANewIncarnationAndCannotRenewTheOldProcessRows() {
+    SandboxInstanceIdentity oldProcess =
+        new SandboxInstanceIdentity("sandbox-0", UUID.fromString("00000000-0000-0000-0000-000000000001"));
+    SandboxInstanceIdentity restartedProcess =
+        new SandboxInstanceIdentity("sandbox-0", UUID.fromString("00000000-0000-0000-0000-000000000002"));
+    SandboxSession session = new SandboxSession();
+    session.setUserId(607L);
+    session.setLanguage("PYTHON");
+    session.setSubmittedCode("old-process");
+    session.setStatus("RUNNING");
+    session.setOwnerInstance(oldProcess.value());
+    session.setLeaseExpiresAt(Instant.now().minusSeconds(1));
+    long id = sessions.saveAndFlush(session).getId();
+
+    int renewed = persistence.renewOwnedLeases(restartedProcess.value());
+
+    assertThat(oldProcess.value()).startsWith("sandbox-0:");
+    assertThat(restartedProcess.value()).startsWith("sandbox-0:");
+    assertThat(restartedProcess.value()).isNotEqualTo(oldProcess.value());
+    assertThat(renewed).isZero();
+    assertThat(sessions.findById(id).orElseThrow().getLeaseExpiresAt())
+        .isBefore(Instant.now());
+  }
+
+  @Test
+  void currentIncarnationCannotReconcileAnExpiredPendingExactResult() {
+    for (RunResult exact : java.util.List.of(
+        new RunResult(SandboxTerminalStatus.COMPLETED, 0, "exact-output", "", 15L, 20, true),
+        new RunResult(SandboxTerminalStatus.TIMED_OUT, -1, "partial", "deadline", 30_000L, 64, true))) {
+      long userId = exact.terminalStatus() == SandboxTerminalStatus.COMPLETED ? 608L : 609L;
+      SandboxSession allocated = persistence.allocate(
+          userId, new SandboxRunRequest("run", "PYTHON", null, null));
+      persistence.markRunning(allocated.getId());
+      SandboxSession expired = sessions.findById(allocated.getId()).orElseThrow();
+      expired.setLeaseExpiresAt(Instant.now().minusSeconds(1));
+      sessions.saveAndFlush(expired);
+
+      assertThat(persistence.reconcileExpired(
+          Instant.now(), Instant.now().minusSeconds(35), 25)).isZero();
+      persistence.finish(allocated.getId(), exact);
+
+      SandboxSession terminal = sessions.findById(allocated.getId()).orElseThrow();
+      assertThat(terminal.getStatus()).isEqualTo(exact.terminalStatus().name());
+      assertThat(terminal.getStdout()).isEqualTo(exact.stdout());
+      assertThat(terminal.getStderr()).isEqualTo(exact.stderr());
+      assertThat(terminal.isOutputTruncated()).isEqualTo(exact.outputTruncated());
+    }
   }
 
   @Test
@@ -278,8 +366,90 @@ class SandboxRunPersistenceLifecycleTest {
       }
     }
 
-    assertThat(persistence.reconcileExpired(
-        Instant.now(), Instant.now().minusSeconds(35), 25)).isEqualTo(1);
+    Instant firstClaimAt = Instant.now();
+    assertThat(persistence.reconcileExpiredAs(
+        "recovery-pod:33333333-3333-3333-3333-333333333333",
+        firstClaimAt, firstClaimAt.minusSeconds(35), 25)).isZero();
+    assertThat(persistence.reconcileExpiredAs(
+        "recovery-pod:33333333-3333-3333-3333-333333333333",
+        firstClaimAt.plusSeconds(31), firstClaimAt.minusSeconds(35), 25)).isEqualTo(1);
+  }
+
+  @Test
+  void otherPodReconcilerCannotFreezeAWrongTerminalBeforePendingExactRetry() {
+    SandboxRunPersistenceService podB = new SandboxRunPersistenceService(
+        sessions,
+        eventPublisher,
+        entityManager,
+        new SandboxInstanceIdentity(
+            "pod-b", UUID.fromString("44444444-4444-4444-4444-444444444444")),
+        20_000L,
+        30_000L,
+        30_000L);
+    TransactionTemplate transactions = new TransactionTemplate(transactionManager);
+    int sequence = 0;
+    for (RunResult exact : java.util.List.of(
+        new RunResult(SandboxTerminalStatus.COMPLETED, 0,
+            "exact-complete", "", 25L, 32, false),
+        new RunResult(SandboxTerminalStatus.TIMED_OUT, -1,
+            "exact-partial", "deadline", 30_000L, 64, true))) {
+      long userId = 620L + sequence++;
+      SandboxSession allocated = persistence.allocate(
+          userId, new SandboxRunRequest("run", "PYTHON", null, null));
+      persistence.markRunning(allocated.getId());
+      SandboxSession expired = sessions.findById(allocated.getId()).orElseThrow();
+      expired.setLeaseExpiresAt(Instant.now().minusSeconds(1));
+      sessions.saveAndFlush(expired);
+
+      java.util.concurrent.atomic.AtomicBoolean databaseDown =
+          new java.util.concurrent.atomic.AtomicBoolean(true);
+      SandboxRunPersistenceService gatedPersistence = mock(SandboxRunPersistenceService.class);
+      when(gatedPersistence.finish(allocated.getId(), exact)).thenAnswer(invocation -> {
+        if (databaseDown.get()) throw new IllegalStateException("database down");
+        return persistence.finish(allocated.getId(), exact);
+      });
+      when(gatedPersistence.finishWithoutEvent(allocated.getId(), exact)).thenAnswer(invocation -> {
+        if (databaseDown.get()) throw new IllegalStateException("database down");
+        return persistence.finishWithoutEvent(allocated.getId(), exact);
+      });
+      SandboxTerminalFinalizer finalizer = new SandboxTerminalFinalizer(
+          gatedPersistence, new io.micrometer.core.instrument.simple.SimpleMeterRegistry(), 1);
+      var reservation = finalizer.reserve();
+      assertThrows(RuntimeException.class,
+          () -> finalizer.finish(allocated.getId(), exact, reservation));
+
+      Instant recoveredAt = Instant.now();
+      int firstClaim = transactions.execute(ignored -> podB.reconcileExpired(
+          recoveredAt, recoveredAt.minusSeconds(35), 25));
+      assertThat(firstClaim).isZero();
+      assertThat(outbox.findTop100ByPublishedAtIsNullOrderByCreatedAtAsc())
+          .noneSatisfy(entry -> assertThat(entry.getAggregateId())
+              .isEqualTo(String.valueOf(allocated.getId())));
+
+      int reconciled = transactions.execute(ignored -> podB.reconcileExpired(
+          recoveredAt.plusSeconds(31), recoveredAt.minusSeconds(35), 25));
+      assertThat(reconciled).isEqualTo(1);
+      SandboxSession inferred = sessions.findById(allocated.getId()).orElseThrow();
+      assertThat(inferred.getStatus()).isEqualTo("KILLED");
+      assertThat(inferred.getTerminalSource()).isEqualTo("RECONCILER");
+      assertThat(outbox.findTop100ByPublishedAtIsNullOrderByCreatedAtAsc())
+          .noneSatisfy(entry -> assertThat(entry.getAggregateId())
+              .isEqualTo(String.valueOf(allocated.getId())));
+
+      databaseDown.set(false);
+      assertThat(finalizer.retryPending()).isEqualTo(1);
+
+      SandboxSession corrected = sessions.findById(allocated.getId()).orElseThrow();
+      assertThat(corrected.getStatus()).isEqualTo(exact.terminalStatus().name());
+      assertThat(corrected.getStdout()).isEqualTo(exact.stdout());
+      assertThat(corrected.getStderr()).isEqualTo(exact.stderr());
+      assertThat(corrected.isOutputTruncated()).isEqualTo(exact.outputTruncated());
+      assertThat(corrected.getTerminalSource()).isEqualTo("RUNNER");
+      assertThat(corrected.getReconciliationStartedAt()).isNull();
+      assertThat(outbox.findTop100ByPublishedAtIsNullOrderByCreatedAtAsc())
+          .filteredOn(entry -> entry.getAggregateId().equals(String.valueOf(allocated.getId())))
+          .hasSize(1);
+    }
   }
 
   private long saveStale(long userId, String status) {

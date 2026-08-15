@@ -9,6 +9,7 @@ import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
@@ -84,6 +85,30 @@ class SandboxRunExecutorTest {
     assertThat(metrics.get("sandbox.runs.terminal")
         .tag("status", "TIMED_OUT").counter().count()).isEqualTo(1.0);
     assertThat(metrics.get("sandbox.runs.truncated").counter().count()).isEqualTo(1.0);
+  }
+
+  @Test
+  void shutdownCancelsQueuedAcceptedWorkAndRunsItsFinalizerWithinTheBudget() throws Exception {
+    executor = new SandboxRunExecutor(1, 1, 2_000, new SimpleMeterRegistry());
+    CountDownLatch firstStarted = new CountDownLatch(1);
+    CountDownLatch release = new CountDownLatch(1);
+    CountDownLatch queuedCancelled = new CountDownLatch(1);
+    AtomicBoolean queuedRan = new AtomicBoolean();
+    executor.submit(1L, () -> blockingWork(firstStarted, release));
+    assertThat(firstStarted.await(1, TimeUnit.SECONDS)).isTrue();
+    executor.submit(2L, () -> new SandboxRunExecutor.CancelableWork() {
+      @Override public void run() { queuedRan.set(true); }
+      @Override public void cancelBeforeStart() { queuedCancelled.countDown(); }
+    });
+
+    long startedAt = System.nanoTime();
+    executor.stopForTest(Duration.ofMillis(250));
+    long elapsedMs = (System.nanoTime() - startedAt) / 1_000_000;
+
+    assertThat(queuedCancelled.await(1, TimeUnit.SECONDS)).isTrue();
+    assertThat(queuedRan).isFalse();
+    assertThat(elapsedMs).isLessThan(400L);
+    release.countDown();
   }
 
   private static Runnable blockingWork(CountDownLatch started, CountDownLatch release) {

@@ -9,6 +9,7 @@ import jakarta.persistence.PrePersist;
 import jakarta.persistence.PreUpdate;
 import jakarta.persistence.Table;
 import java.time.Instant;
+import java.util.UUID;
 
 @Entity
 @Table(name = "sandbox_sessions")
@@ -23,6 +24,9 @@ public class SandboxSession {
   @Column(name = "container_id") private String containerId;
   @Column(name = "owner_instance") private String ownerInstance;
   @Column(name = "lease_expires_at") private Instant leaseExpiresAt;
+  @Column(name = "reconciliation_token") private UUID reconciliationToken;
+  @Column(name = "reconciliation_started_at") private Instant reconciliationStartedAt;
+  @Column(name = "terminal_source") private String terminalSource;
   @Column(nullable = false) private String status;
   @Column(name = "submitted_code", nullable = false) private String submittedCode;
   @Column(name = "stdout") private String stdout;
@@ -64,6 +68,16 @@ public class SandboxSession {
   public void setOwnerInstance(String ownerInstance) { this.ownerInstance = ownerInstance; }
   public Instant getLeaseExpiresAt() { return leaseExpiresAt; }
   public void setLeaseExpiresAt(Instant leaseExpiresAt) { this.leaseExpiresAt = leaseExpiresAt; }
+  public UUID getReconciliationToken() { return reconciliationToken; }
+  public void setReconciliationToken(UUID reconciliationToken) {
+    this.reconciliationToken = reconciliationToken;
+  }
+  public Instant getReconciliationStartedAt() { return reconciliationStartedAt; }
+  public void setReconciliationStartedAt(Instant reconciliationStartedAt) {
+    this.reconciliationStartedAt = reconciliationStartedAt;
+  }
+  public String getTerminalSource() { return terminalSource; }
+  public void setTerminalSource(String terminalSource) { this.terminalSource = terminalSource; }
   public String getStatus() { return status; }
   public void setStatus(String status) { this.status = status; }
   public String getSubmittedCode() { return submittedCode; }

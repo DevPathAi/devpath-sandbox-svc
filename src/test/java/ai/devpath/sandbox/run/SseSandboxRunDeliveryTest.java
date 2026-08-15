@@ -72,4 +72,33 @@ class SseSandboxRunDeliveryTest {
     delivery.complete();
     releaser.join();
   }
+
+  @Test
+  void saturatedLogQueueStillDeliversResultAndCompletionControlFrames() throws Exception {
+    SseEmitter emitter = mock(SseEmitter.class);
+    CountDownLatch firstSendStarted = new CountDownLatch(1);
+    CountDownLatch releaseFirstSend = new CountDownLatch(1);
+    AtomicBoolean first = new AtomicBoolean(true);
+    org.mockito.Mockito.doAnswer(invocation -> {
+      if (first.compareAndSet(true, false)) {
+        firstSendStarted.countDown();
+        releaseFirstSend.await(2, TimeUnit.SECONDS);
+      }
+      return null;
+    }).when(emitter).send(any(SseEmitter.SseEventBuilder.class));
+    SseSandboxRunDelivery delivery = new SseSandboxRunDelivery(emitter, true);
+    delivery.session(44L);
+    assertThat(firstSendStarted.await(1, TimeUnit.SECONDS)).isTrue();
+    for (int i = 0; i < 10_000; i++) {
+      delivery.log("saturated-" + i);
+    }
+
+    delivery.result(new SandboxTerminalEvent(44L, "COMPLETED", 0, true));
+    delivery.complete();
+    releaseFirstSend.countDown();
+
+    verify(emitter, org.mockito.Mockito.timeout(1_000).times(2))
+        .send(any(SseEmitter.SseEventBuilder.class));
+    verify(emitter, org.mockito.Mockito.timeout(1_000)).complete();
+  }
 }

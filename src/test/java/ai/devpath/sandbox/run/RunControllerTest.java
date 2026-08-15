@@ -98,6 +98,22 @@ class RunControllerTest {
   }
 
   @Test
+  void exhaustedTerminalResultHeadroomFailsClosedWith503BeforeStarting() throws Exception {
+    org.mockito.Mockito.doThrow(
+        new SandboxUnavailableException("Sandbox terminal result capacity is full"))
+        .when(sandboxRunService).assertCanAdmit(44L);
+
+    mvc.perform(post("/sandbox/run")
+            .with(jwt().jwt(j -> j.subject("44")))
+            .contentType(MediaType.APPLICATION_JSON)
+            .content("{\"code\":\"print(1)\",\"language\":\"PYTHON\"}"))
+        .andExpect(status().isServiceUnavailable());
+
+    verify(sandboxRunService, never()).isRunnerAvailable();
+    verify(sandboxRunService, never()).start(anyLong(), any(), any());
+  }
+
+  @Test
   void oversizedCodeReturns400() throws Exception {
     String bigCode = "x".repeat(65537);
     mvc.perform(post("/sandbox/run")
@@ -114,5 +130,33 @@ class RunControllerTest {
             .contentType(MediaType.APPLICATION_JSON)
             .content("{\"code\":\"print(1)\"}"))
         .andExpect(status().isBadRequest());
+  }
+
+  @Test
+  void blankCodeReturns400WithoutAdmission() throws Exception {
+    mvc.perform(post("/sandbox/run")
+            .with(jwt().jwt(j -> j.subject("42")))
+            .contentType(MediaType.APPLICATION_JSON)
+            .content("{\"code\":\"   \",\"language\":\"PYTHON\"}"))
+        .andExpect(status().isBadRequest());
+
+    verify(sandboxRunService, never()).start(anyLong(), any(), any());
+  }
+
+  @Test
+  void optionalIdsMustBePositiveAndJavascriptSafe() throws Exception {
+    for (String ids : java.util.List.of(
+        "\"contentId\":0",
+        "\"contentId\":9007199254740992",
+        "\"codeBlockId\":-1",
+        "\"codeBlockId\":9007199254740992")) {
+      mvc.perform(post("/sandbox/run")
+              .with(jwt().jwt(j -> j.subject("42")))
+              .contentType(MediaType.APPLICATION_JSON)
+              .content("{\"code\":\"print(1)\",\"language\":\"PYTHON\"," + ids + "}"))
+          .andExpect(status().isBadRequest());
+    }
+
+    verify(sandboxRunService, never()).start(anyLong(), any(), any());
   }
 }

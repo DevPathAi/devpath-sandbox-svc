@@ -15,11 +15,16 @@ class GracefulShutdownConfigTest {
   @Autowired Environment environment;
 
   @Test
-  void springAndExecutorDrainBudgetsAreAtLeastNinetySeconds() {
+  void executorFinishesBeforeSpringAndPodShutdownBudgets() {
     assertThat(environment.getProperty("server.shutdown")).isEqualTo("graceful");
     assertThat(environment.getProperty("spring.lifecycle.timeout-per-shutdown-phase"))
         .isEqualTo("90s");
     assertThat(environment.getProperty(
-        "devpath.sandbox.executor.drain-timeout-ms", Long.class)).isGreaterThanOrEqualTo(90_000L);
+        "devpath.sandbox.executor.drain-timeout-ms", Long.class)).isEqualTo(75_000L);
+    assertThat(environment.getProperty(
+        "spring.datasource.hikari.connection-timeout", Long.class)).isEqualTo(4_000L);
+    assertThat(environment.getProperty("spring.datasource.hikari.data-source-properties.socketTimeout"))
+        .isEqualTo("4");
+    assertThat(environment.getProperty("spring.transaction.default-timeout")).isEqualTo("4s");
   }
 }

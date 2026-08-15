@@ -21,24 +21,36 @@ public class SandboxRunPersistenceService {
   private final EntityManager entityManager;
   private final String ownerInstance;
   private final long leaseDurationMs;
+  private final long reconciliationGraceMs;
+  private final long reconciliationPublishGraceMs;
 
   public SandboxRunPersistenceService(
       SandboxSessionRepository sessions,
       SandboxRunEventPublisher eventPublisher,
       EntityManager entityManager,
-      @Value("${devpath.sandbox.instance-id}") String ownerInstance,
-      @Value("${devpath.sandbox.lease.duration-ms:20000}") long leaseDurationMs) {
+      SandboxInstanceIdentity instanceIdentity,
+      @Value("${devpath.sandbox.lease.duration-ms:20000}") long leaseDurationMs,
+      @Value("${devpath.sandbox.reconcile.correction-grace-ms:30000}")
+      long reconciliationGraceMs,
+      @Value("${devpath.sandbox.reconcile.publish-grace-ms:30000}")
+      long reconciliationPublishGraceMs) {
+    String ownerInstance = instanceIdentity.value();
     if (ownerInstance == null || ownerInstance.isBlank()) {
       throw new IllegalArgumentException("Sandbox instance id must not be blank");
     }
     if (leaseDurationMs < 1) {
       throw new IllegalArgumentException("Sandbox lease duration must be positive");
     }
+    if (reconciliationGraceMs < 1 || reconciliationPublishGraceMs < 1) {
+      throw new IllegalArgumentException("Sandbox reconciliation grace must be positive");
+    }
     this.sessions = sessions;
     this.eventPublisher = eventPublisher;
     this.entityManager = entityManager;
     this.ownerInstance = ownerInstance;
     this.leaseDurationMs = leaseDurationMs;
+    this.reconciliationGraceMs = reconciliationGraceMs;
+    this.reconciliationPublishGraceMs = reconciliationPublishGraceMs;
   }
 
   /** Capacity has already been reserved; commit only ALLOCATING and its stable identifier. */
@@ -103,8 +115,14 @@ public class SandboxRunPersistenceService {
   /** Renews queued and running rows owned by this process, independently of SSE delivery. */
   @Transactional
   public int renewOwnedLeases() {
+    return renewOwnedLeases(ownerInstance);
+  }
+
+  /** Testable exact-owner entry point; a new process on the same pod cannot renew old rows. */
+  @Transactional
+  int renewOwnedLeases(String exactOwnerInstance) {
     return sessions.renewOwnedLeases(
-        ownerInstance, Instant.now().plusMillis(leaseDurationMs));
+        exactOwnerInstance, Instant.now().plusMillis(leaseDurationMs));
   }
 
   /** Persist terminal state and its Review outbox entry in one transaction. */
@@ -112,7 +130,7 @@ public class SandboxRunPersistenceService {
   public SandboxSession finish(long sessionId, RunResult rawResult) {
     SandboxSession session = sessions.findByIdForUpdate(sessionId)
         .orElseThrow(() -> new SessionNotFoundException("sandbox session not found"));
-    if (TERMINAL_STATUSES.contains(session.getStatus())) {
+    if (TERMINAL_STATUSES.contains(session.getStatus()) && !canCorrect(session)) {
       publishTerminal(session);
       return session;
     }
@@ -127,7 +145,7 @@ public class SandboxRunPersistenceService {
   public SandboxSession finishWithoutEvent(long sessionId, RunResult rawResult) {
     SandboxSession session = sessions.findByIdForUpdate(sessionId)
         .orElseThrow(() -> new SessionNotFoundException("sandbox session not found"));
-    if (TERMINAL_STATUSES.contains(session.getStatus())) {
+    if (TERMINAL_STATUSES.contains(session.getStatus()) && !canCorrect(session)) {
       return session;
     }
     return applyTerminal(session, rawResult);
@@ -136,11 +154,18 @@ public class SandboxRunPersistenceService {
   /** Repairs terminal-only fallbacks. The deterministic outbox key makes races harmless. */
   @Transactional
   public int repairMissingTerminalEvents(int batchSize) {
+    return repairMissingTerminalEvents(
+        batchSize, Instant.now().minusMillis(reconciliationPublishGraceMs));
+  }
+
+  @Transactional
+  int repairMissingTerminalEvents(int batchSize, Instant reconciliationPublishCutoff) {
     if (batchSize < 1) {
       throw new IllegalArgumentException("Outbox repair batch size must be positive");
     }
     int inserted = 0;
-    for (SandboxSession session : sessions.findTerminalWithoutOutbox(batchSize)) {
+    for (SandboxSession session : sessions.findTerminalWithoutOutbox(
+        reconciliationPublishCutoff, batchSize)) {
       if (eventPublisher.publishSubmitted(
           session.getId(), session.getUserId(), session.getLanguage(), session.getContentId())) {
         inserted++;
@@ -152,16 +177,37 @@ public class SandboxRunPersistenceService {
   /** Reconcile accepted rows left non-terminal by process loss. */
   @Transactional
   public int reconcileExpired(Instant now, Instant legacyCutoff, int batchSize) {
+    return reconcileExpiredAs(ownerInstance, now, legacyCutoff, batchSize);
+  }
+
+  @Transactional
+  int reconcileExpiredAs(
+      String reconcilerInstance,
+      Instant now,
+      Instant legacyCutoff,
+      int batchSize) {
     if (batchSize < 1) {
       throw new IllegalArgumentException("Reconciliation batch size must be positive");
     }
     int reconciled = 0;
     for (SandboxSession session : sessions.findExpiredForReconciliation(
-        now, legacyCutoff, batchSize)) {
+        now, legacyCutoff, reconcilerInstance, batchSize)) {
       boolean expired = session.getLeaseExpiresAt() == null
           ? session.getUpdatedAt().isBefore(legacyCutoff)
           : !session.getLeaseExpiresAt().isAfter(now);
       if (TERMINAL_STATUSES.contains(session.getStatus()) || !expired) {
+        continue;
+      }
+      Instant reconciliationStartedAt = session.getReconciliationStartedAt();
+      if (reconciliationStartedAt == null) {
+        session.setReconciliationToken(java.util.UUID.randomUUID());
+        session.setReconciliationStartedAt(now);
+        // Give legacy rows a lease-based path through the second reconciliation phase.
+        session.setLeaseExpiresAt(now);
+        sessions.save(session);
+        continue;
+      }
+      if (reconciliationStartedAt.isAfter(now.minusMillis(reconciliationGraceMs))) {
         continue;
       }
       SandboxTerminalStatus terminal = "ALLOCATING".equals(session.getStatus())
@@ -171,8 +217,10 @@ public class SandboxRunPersistenceService {
       session.setFinishedAt(now);
       session.setExitCode(terminal == SandboxTerminalStatus.FAILED ? 1 : -1);
       session.setLeaseExpiresAt(null);
-      SandboxSession saved = sessions.save(session);
-      publishTerminal(saved);
+      session.setTerminalSource("RECONCILER");
+      // Start a second grace before outbox publication so a surviving exact owner can correct.
+      session.setReconciliationStartedAt(now);
+      sessions.save(session);
       reconciled++;
     }
     return reconciled;
@@ -209,6 +257,14 @@ public class SandboxRunPersistenceService {
     session.setOutputTruncated(result.outputTruncated());
     session.setStatus(result.terminalStatus().name());
     session.setLeaseExpiresAt(null);
+    session.setTerminalSource("RUNNER");
+    session.setReconciliationToken(null);
+    session.setReconciliationStartedAt(null);
     return sessions.save(session);
+  }
+
+  private boolean canCorrect(SandboxSession session) {
+    return "RECONCILER".equals(session.getTerminalSource())
+        && ownerInstance.equals(session.getOwnerInstance());
   }
 }

@@ -21,6 +21,7 @@ public class RunController {
   static final String SESSION_HEADER = "X-Sandbox-Session-Id";
   static final String EVENT_VERSION_HEADER = "X-Sandbox-Event-Version";
   private static final int MAX_CODE_BYTES = 64 * 1024;
+  private static final long MAX_JAVASCRIPT_SAFE_INTEGER = 9_007_199_254_740_991L;
 
   private final SandboxRunService runService;
   private final SandboxHeartbeatScheduler heartbeatScheduler;
@@ -72,11 +73,22 @@ public class RunController {
     if (request == null || request.code() == null || request.language() == null) {
       throw new IllegalArgumentException("code와 language는 필수입니다.");
     }
+    if (request.code().isBlank()) {
+      throw new IllegalArgumentException("code는 비어 있을 수 없습니다.");
+    }
     if (request.code().getBytes(StandardCharsets.UTF_8).length > MAX_CODE_BYTES) {
       throw new IllegalArgumentException("코드 크기 제한(64KB) 초과");
     }
     if (!request.language().matches("JAVA|NODE|PYTHON")) {
       throw new IllegalArgumentException("지원하지 않는 language: " + request.language());
+    }
+    validateOptionalId("contentId", request.contentId());
+    validateOptionalId("codeBlockId", request.codeBlockId());
+  }
+
+  private static void validateOptionalId(String name, Long value) {
+    if (value != null && (value < 1 || value > MAX_JAVASCRIPT_SAFE_INTEGER)) {
+      throw new IllegalArgumentException(name + "는 양의 JavaScript-safe 정수여야 합니다.");
     }
   }
 }

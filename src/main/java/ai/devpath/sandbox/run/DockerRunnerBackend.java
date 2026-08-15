@@ -36,7 +36,11 @@ import org.springframework.stereotype.Component;
 public class DockerRunnerBackend implements RunnerBackend {
 
   private static final int TIMEOUT_SECONDS = 30;
-  private static final int ORPHAN_DEADLINE_SECONDS = TIMEOUT_SECONDS + 15;
+  private static final int SETUP_ORPHAN_DEADLINE_SECONDS = 4 * 45 + 15;
+  // Container creation, durable attach, and start are bounded remote operations that happen
+  // after labels are fixed. Their headroom cannot consume the user's execution timeout.
+  private static final int EXECUTION_ORPHAN_DEADLINE_SECONDS = TIMEOUT_SECONDS + 2 * 45 + 15;
+  private static final int VOLUME_ORPHAN_DEADLINE_SECONDS = 8 * 60;
   private static final long MEMORY_BYTES = 512L * 1024 * 1024;
   private static final long NANO_CPUS = 1_000_000_000L;
   private static final long PIDS_LIMIT = 128L;
@@ -92,21 +96,23 @@ public class DockerRunnerBackend implements RunnerBackend {
     String sourceVolume = null;
     ResultCallback.Adapter<Frame> logStream = null;
     SandboxOutputCapture output = new SandboxOutputCapture();
+    Utf8StreamDecoder stdoutDecoder = new Utf8StreamDecoder();
+    Utf8StreamDecoder stderrDecoder = new Utf8StreamDecoder();
 
     try {
       docker = openClient();
       docker.pingCmd().exec();
 
-      // Keep the orphan deadline beyond the synchronous execution timeout so
-      // the independent reaper cannot relabel a live timeout as KILLED.
-      Instant deadline = Instant.now().plusSeconds(ORPHAN_DEADLINE_SECONDS);
-      Map<String, String> labels = executionLabels(spec.sandboxSessionId(), deadline);
+      Instant setupStarted = Instant.now();
+      Map<String, String> volumeLabels = volumeLabels(spec.sandboxSessionId(), setupStarted);
       sourceVolume = sourceVolumeName(spec.sandboxSessionId());
       docker.createVolumeCmd()
           .withName(sourceVolume)
-          .withLabels(labels)
+          .withLabels(volumeLabels)
           .exec();
 
+      Map<String, String> setupLabels =
+          setupLabels(spec.sandboxSessionId(), Instant.now());
       CreateContainerResponse loader = docker.createContainerCmd(runtime.image())
           .withAttachStdout(false)
           .withAttachStderr(false)
@@ -114,7 +120,7 @@ public class DockerRunnerBackend implements RunnerBackend {
           .withHostConfig(sourceLoaderHostConfig(sourceVolume, properties))
           .withUser("nobody")
           .withWorkingDir("/workspace")
-          .withLabels(labels)
+          .withLabels(setupLabels)
           .exec();
       loaderContainerId = loader.getId();
       docker.startContainerCmd(loaderContainerId).exec();
@@ -126,6 +132,9 @@ public class DockerRunnerBackend implements RunnerBackend {
       loaderContainerId = null;
 
       HostConfig hostConfig = hardenedHostConfig(sourceVolume, properties);
+      // Setup and source transfer do not consume the user's 30-second execution window.
+      Map<String, String> executionLabels =
+          executionLabelsFromStart(spec.sandboxSessionId(), Instant.now());
 
       CreateContainerResponse container = docker.createContainerCmd(runtime.image())
           .withAttachStdout(true)
@@ -134,7 +143,7 @@ public class DockerRunnerBackend implements RunnerBackend {
           .withHostConfig(hostConfig)
           .withUser("nobody")
           .withWorkingDir("/workspace")
-          .withLabels(labels)
+          .withLabels(executionLabels)
           .exec();
       containerId = container.getId();
 
@@ -151,7 +160,8 @@ public class DockerRunnerBackend implements RunnerBackend {
           .exec(new ResultCallback.Adapter<>() {
             @Override
             public void onNext(Frame frame) {
-              appendFrame(frame, output, logCallback);
+              appendFrame(
+                  frame, output, logCallback, stdoutDecoder, stderrDecoder);
             }
           });
 
@@ -161,6 +171,7 @@ public class DockerRunnerBackend implements RunnerBackend {
       if (!completed) {
         killQuietly(docker, containerId);
         awaitLogs(logStream);
+        finishDecoders(output, logCallback, stdoutDecoder, stderrDecoder);
         String message = "Execution timed out after " + TIMEOUT_SECONDS + "s\n";
         String accepted = output.appendStderr(message);
         if (!accepted.isEmpty()) {
@@ -171,6 +182,7 @@ public class DockerRunnerBackend implements RunnerBackend {
 
       Integer exitCode = waitCallback.awaitStatusCode();
       awaitLogs(logStream);
+      finishDecoders(output, logCallback, stdoutDecoder, stderrDecoder);
       int resolvedExitCode = exitCode == null ? -1 : exitCode;
       return output.result(
           SandboxTerminalStatus.fromLegacyExitCode(resolvedExitCode),
@@ -262,6 +274,21 @@ public class DockerRunnerBackend implements RunnerBackend {
         DEADLINE_LABEL, deadline.toString());
   }
 
+  static Map<String, String> setupLabels(long sessionId, Instant setupStarted) {
+    return executionLabels(
+        sessionId, setupStarted.plusSeconds(SETUP_ORPHAN_DEADLINE_SECONDS));
+  }
+
+  static Map<String, String> executionLabelsFromStart(long sessionId, Instant executionStarted) {
+    return executionLabels(
+        sessionId, executionStarted.plusSeconds(EXECUTION_ORPHAN_DEADLINE_SECONDS));
+  }
+
+  static Map<String, String> volumeLabels(long sessionId, Instant setupStarted) {
+    return executionLabels(
+        sessionId, setupStarted.plusSeconds(VOLUME_ORPHAN_DEADLINE_SECONDS));
+  }
+
   static boolean isExpiredContainer(Map<String, String> labels, Instant now) {
     if (labels == null || !"true".equals(labels.get(MANAGED_LABEL))) {
       return false;
@@ -338,10 +365,30 @@ public class DockerRunnerBackend implements RunnerBackend {
   private static void appendFrame(
       Frame frame,
       SandboxOutputCapture output,
+      Consumer<String> logCallback,
+      Utf8StreamDecoder stdoutDecoder,
+      Utf8StreamDecoder stderrDecoder) {
+    boolean stderr = frame.getStreamType() == StreamType.STDERR;
+    String chunk = (stderr ? stderrDecoder : stdoutDecoder).decode(frame.getPayload());
+    appendDecoded(chunk, stderr, output, logCallback);
+  }
+
+  private static void finishDecoders(
+      SandboxOutputCapture output,
+      Consumer<String> logCallback,
+      Utf8StreamDecoder stdoutDecoder,
+      Utf8StreamDecoder stderrDecoder) {
+    appendDecoded(stdoutDecoder.finish(), false, output, logCallback);
+    appendDecoded(stderrDecoder.finish(), true, output, logCallback);
+  }
+
+  private static void appendDecoded(
+      String chunk,
+      boolean stderr,
+      SandboxOutputCapture output,
       Consumer<String> logCallback) {
-    String chunk = new String(frame.getPayload(), StandardCharsets.UTF_8);
     String accepted;
-    if (frame.getStreamType() == StreamType.STDERR) {
+    if (stderr) {
       accepted = output.appendStderr(chunk);
     } else {
       accepted = output.appendStdout(chunk);

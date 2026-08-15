@@ -7,6 +7,8 @@ import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.atLeastOnce;
 
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.time.Duration;
@@ -75,5 +77,74 @@ class SandboxRunServiceLifecycleTest {
     order.verify(backend).run(any(), any(), any());
     order.verify(persistence).attachContainer(91L, "container-91");
     order.verify(persistence).finish(anyLong(), any());
+  }
+
+  @Test
+  void drainDurablyKillsQueuedAcceptedWorkAndCompletesItsDeliveryBeforeReturning()
+      throws Exception {
+    SandboxRunPersistenceService persistence = mock(SandboxRunPersistenceService.class);
+    RunnerBackend backend = mock(RunnerBackend.class);
+    SimpleMeterRegistry metrics = new SimpleMeterRegistry();
+    executor = new SandboxRunExecutor(1, 1, 2_000, metrics);
+    SandboxTerminalFinalizer finalizer = new SandboxTerminalFinalizer(persistence, metrics, 1);
+    SandboxRunService service = new SandboxRunService(persistence, backend, executor, finalizer);
+    java.util.concurrent.atomic.AtomicLong ids = new java.util.concurrent.atomic.AtomicLong(200L);
+    when(persistence.allocate(anyLong(), any())).thenAnswer(invocation -> {
+      SandboxSession allocated = mock(SandboxSession.class);
+      when(allocated.getId()).thenReturn(ids.incrementAndGet());
+      return allocated;
+    });
+    when(persistence.markRunning(201L)).thenReturn(true);
+    CountDownLatch runnerStarted = new CountDownLatch(1);
+    when(backend.run(any(), any(), any())).thenAnswer(invocation -> {
+      runnerStarted.countDown();
+      try {
+        new CountDownLatch(1).await();
+      } catch (InterruptedException interrupted) {
+        Thread.currentThread().interrupt();
+        throw new SandboxUnavailableException("shutdown", interrupted);
+      }
+      return new RunResult(0, "", "", null, null);
+    });
+    when(persistence.finish(anyLong(), any())).thenAnswer(invocation -> {
+      long sessionId = invocation.getArgument(0);
+      RunResult result = invocation.getArgument(1);
+      SandboxSession terminal = mock(SandboxSession.class);
+      when(terminal.getId()).thenReturn(sessionId);
+      when(terminal.getStatus()).thenReturn(result.terminalStatus().name());
+      when(terminal.getExitCode()).thenReturn(result.exitCode());
+      when(terminal.isOutputTruncated()).thenReturn(result.outputTruncated());
+      return terminal;
+    });
+    SandboxRunDelivery ignoredDelivery = noOpDelivery();
+    CountDownLatch queuedCompleted = new CountDownLatch(1);
+    SandboxRunDelivery queuedDelivery = new SandboxRunDelivery() {
+      @Override public void session(long sessionId) {}
+      @Override public void log(String line) {}
+      @Override public void result(SandboxTerminalEvent event) {}
+      @Override public void complete() { queuedCompleted.countDown(); }
+    };
+
+    service.start(1L, new SandboxRunRequest("first", "PYTHON", null, null), ignoredDelivery);
+    assertThat(runnerStarted.await(1, TimeUnit.SECONDS)).isTrue();
+    AcceptedSandboxRun queued = service.start(
+        2L, new SandboxRunRequest("queued", "PYTHON", null, null), queuedDelivery);
+
+    executor.stopForTest(Duration.ofMillis(300));
+
+    assertThat(queued.sessionId()).isEqualTo(202L);
+    assertThat(queuedCompleted.await(1, TimeUnit.SECONDS)).isTrue();
+    verify(persistence, atLeastOnce()).finish(eq(202L),
+        org.mockito.ArgumentMatchers.argThat(
+            result -> result.terminalStatus() == SandboxTerminalStatus.KILLED));
+  }
+
+  private static SandboxRunDelivery noOpDelivery() {
+    return new SandboxRunDelivery() {
+      @Override public void session(long sessionId) {}
+      @Override public void log(String line) {}
+      @Override public void result(SandboxTerminalEvent event) {}
+      @Override public void complete() {}
+    };
   }
 }

@@ -27,6 +27,7 @@ public interface SandboxSessionRepository extends JpaRepository<SandboxSession, 
       SELECT *
       FROM sandbox_sessions
       WHERE status IN ('ALLOCATING', 'RUNNING')
+        AND (owner_instance IS NULL OR owner_instance <> :currentOwner)
         AND (
           (lease_expires_at IS NOT NULL AND lease_expires_at <= :now)
           OR
@@ -39,12 +40,15 @@ public interface SandboxSessionRepository extends JpaRepository<SandboxSession, 
   List<SandboxSession> findExpiredForReconciliation(
       @Param("now") java.time.Instant now,
       @Param("legacyCutoff") java.time.Instant legacyCutoff,
+      @Param("currentOwner") String currentOwner,
       @Param("batchSize") int batchSize);
 
   @Modifying(clearAutomatically = true, flushAutomatically = true)
   @Query(value = """
       UPDATE sandbox_sessions
-      SET lease_expires_at = :leaseExpiresAt
+      SET lease_expires_at = :leaseExpiresAt,
+          reconciliation_token = NULL,
+          reconciliation_started_at = NULL
       WHERE owner_instance = :ownerInstance
         AND status IN ('ALLOCATING', 'RUNNING')
       """, nativeQuery = true)
@@ -56,6 +60,11 @@ public interface SandboxSessionRepository extends JpaRepository<SandboxSession, 
       SELECT session.*
       FROM sandbox_sessions session
       WHERE session.status IN ('COMPLETED', 'FAILED', 'KILLED', 'TIMED_OUT')
+        AND (
+          session.terminal_source IS NULL
+          OR session.terminal_source <> 'RECONCILER'
+          OR session.reconciliation_started_at <= :reconciliationPublishCutoff
+        )
         AND NOT EXISTS (
           SELECT 1
           FROM outbox event
@@ -70,5 +79,7 @@ public interface SandboxSessionRepository extends JpaRepository<SandboxSession, 
       ORDER BY session.finished_at, session.id
       LIMIT :batchSize
       """, nativeQuery = true)
-  List<SandboxSession> findTerminalWithoutOutbox(@Param("batchSize") int batchSize);
+  List<SandboxSession> findTerminalWithoutOutbox(
+      @Param("reconciliationPublishCutoff") java.time.Instant reconciliationPublishCutoff,
+      @Param("batchSize") int batchSize);
 }

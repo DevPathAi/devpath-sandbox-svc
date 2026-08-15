@@ -21,6 +21,8 @@ public class SandboxSession {
   @Column(name = "code_block_id") private Long codeBlockId;
   @Column(nullable = false) private String language;
   @Column(name = "container_id") private String containerId;
+  @Column(name = "owner_instance") private String ownerInstance;
+  @Column(name = "lease_expires_at") private Instant leaseExpiresAt;
   @Column(nullable = false) private String status;
   @Column(name = "submitted_code", nullable = false) private String submittedCode;
   @Column(name = "stdout") private String stdout;
@@ -58,6 +60,10 @@ public class SandboxSession {
   public void setLanguage(String language) { this.language = language; }
   public String getContainerId() { return containerId; }
   public void setContainerId(String containerId) { this.containerId = containerId; }
+  public String getOwnerInstance() { return ownerInstance; }
+  public void setOwnerInstance(String ownerInstance) { this.ownerInstance = ownerInstance; }
+  public Instant getLeaseExpiresAt() { return leaseExpiresAt; }
+  public void setLeaseExpiresAt(Instant leaseExpiresAt) { this.leaseExpiresAt = leaseExpiresAt; }
   public String getStatus() { return status; }
   public void setStatus(String status) { this.status = status; }
   public String getSubmittedCode() { return submittedCode; }

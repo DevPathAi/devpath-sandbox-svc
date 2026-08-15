@@ -6,6 +6,7 @@ import jakarta.persistence.LockModeType;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Lock;
+import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
@@ -22,9 +23,52 @@ public interface SandboxSessionRepository extends JpaRepository<SandboxSession, 
   @Query("select session from SandboxSession session where session.id = :id")
   Optional<SandboxSession> findByIdForUpdate(@Param("id") long id);
 
-  @Query("select session.id from SandboxSession session "
-      + "where session.status in :statuses and session.updatedAt < :cutoff")
-  List<Long> findStaleIds(
-      @Param("statuses") List<String> statuses,
-      @Param("cutoff") java.time.Instant cutoff);
+  @Query(value = """
+      SELECT *
+      FROM sandbox_sessions
+      WHERE status IN ('ALLOCATING', 'RUNNING')
+        AND (
+          (lease_expires_at IS NOT NULL AND lease_expires_at <= :now)
+          OR
+          (lease_expires_at IS NULL AND updated_at < :legacyCutoff)
+        )
+      ORDER BY COALESCE(lease_expires_at, updated_at), id
+      LIMIT :batchSize
+      FOR UPDATE SKIP LOCKED
+      """, nativeQuery = true)
+  List<SandboxSession> findExpiredForReconciliation(
+      @Param("now") java.time.Instant now,
+      @Param("legacyCutoff") java.time.Instant legacyCutoff,
+      @Param("batchSize") int batchSize);
+
+  @Modifying(clearAutomatically = true, flushAutomatically = true)
+  @Query(value = """
+      UPDATE sandbox_sessions
+      SET lease_expires_at = :leaseExpiresAt
+      WHERE owner_instance = :ownerInstance
+        AND status IN ('ALLOCATING', 'RUNNING')
+      """, nativeQuery = true)
+  int renewOwnedLeases(
+      @Param("ownerInstance") String ownerInstance,
+      @Param("leaseExpiresAt") java.time.Instant leaseExpiresAt);
+
+  @Query(value = """
+      SELECT session.*
+      FROM sandbox_sessions session
+      WHERE session.status IN ('COMPLETED', 'FAILED', 'KILLED', 'TIMED_OUT')
+        AND NOT EXISTS (
+          SELECT 1
+          FROM outbox event
+          WHERE event.dedupe_key = 'sandbox.run.submitted:' || session.id
+             OR (
+               event.dedupe_key IS NULL
+               AND event.aggregate_type = 'sandbox_session'
+               AND event.aggregate_id = CAST(session.id AS text)
+               AND event.event_type = 'sandbox.run.submitted'
+             )
+        )
+      ORDER BY session.finished_at, session.id
+      LIMIT :batchSize
+      """, nativeQuery = true)
+  List<SandboxSession> findTerminalWithoutOutbox(@Param("batchSize") int batchSize);
 }

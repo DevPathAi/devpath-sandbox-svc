@@ -41,11 +41,12 @@ public class RunController {
       @RequestBody SandboxRunRequest request,
       @RequestHeader(name = EVENT_VERSION_HEADER, required = false) String eventVersion) {
     validate(request);
+    long userId = Long.parseLong(jwt.getSubject());
+    runService.assertCanAdmit(userId);
     if (!runService.isRunnerAvailable()) {
       throw new SandboxUnavailableException("Sandbox runner is not available");
     }
 
-    long userId = Long.parseLong(jwt.getSubject());
     SseEmitter emitter = new SseEmitter(sseTimeoutMs);
     boolean terminalEventsEnabled = "2".equals(eventVersion);
     SandboxRunDelivery delivery = heartbeatScheduler.wrap(

@@ -34,6 +34,7 @@ class SandboxRunExecutorTest {
 
     assertThrows(SandboxBusyException.class,
         () -> executor.submit(41L, () -> () -> {}));
+    assertThrows(SandboxBusyException.class, () -> executor.assertCanAdmit(41L));
 
     release.countDown();
   }

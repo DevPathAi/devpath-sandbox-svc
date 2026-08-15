@@ -31,4 +31,10 @@ class SecurityConfigTest {
             .content("{\"code\":\"print(1)\",\"language\":\"PYTHON\"}"))
         .andExpect(status().isUnauthorized());
   }
+
+  @Test
+  void internalApiRequiresWorkloadCredential() throws Exception {
+    mvc.perform(get("/internal/sandbox/sessions/recent").param("userId", "1"))
+        .andExpect(status().isUnauthorized());
+  }
 }

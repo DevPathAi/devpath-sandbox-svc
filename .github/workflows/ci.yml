@@ -27,12 +27,18 @@ jobs:
           --health-retries 5
     steps:
       - uses: actions/checkout@v6
+      - name: Checkout immutable shared contract
+        uses: actions/checkout@v6
+        with:
+          repository: DevPathAi/devpath-shared
+          ref: d26a623c2cc7c3ddbb4e399355f3e5bb604076ab
+          path: .ci/devpath-shared
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 21
       - uses: gradle/actions/setup-gradle@v6
-      - run: ./gradlew --refresh-dependencies build "-Dgroups=!docker"
+      - run: ./gradlew build "-Dgroups=!docker"
         env:
           DB_URL: jdbc:postgresql://localhost:5432/devpath
           DB_USER: devpath
@@ -44,7 +50,7 @@ jobs:
           docker pull eclipse-temurin:21-jdk
           docker pull node:20-alpine
           docker pull python:3.12-slim
-      - run: ./gradlew --refresh-dependencies test "-Dgroups=docker"
+      - run: ./gradlew test "-Dgroups=docker"
         env:
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -58,12 +64,18 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v6
+      - name: Checkout immutable shared contract
+        uses: actions/checkout@v6
+        with:
+          repository: DevPathAi/devpath-shared
+          ref: d26a623c2cc7c3ddbb4e399355f3e5bb604076ab
+          path: .ci/devpath-shared
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 21
       - uses: gradle/actions/setup-gradle@v6
-      - run: ./gradlew --refresh-dependencies bootJar
+      - run: ./gradlew bootJar
         env:
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

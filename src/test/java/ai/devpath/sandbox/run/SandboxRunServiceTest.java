@@ -35,7 +35,7 @@ class SandboxRunServiceTest {
 
   @Test
   void successfulRunCompletesSessionAndPublishesEvent() throws Exception {
-    when(runnerBackend.run(any(), any()))
+    when(runnerBackend.run(any(), any(), any()))
         .thenReturn(new RunResult(0, "ok\n", "", 120L, 24));
     RecordingDelivery delivery = new RecordingDelivery();
 
@@ -54,7 +54,7 @@ class SandboxRunServiceTest {
 
   @Test
   void explicitTimedOutResultIsNotCollapsedIntoKilled() throws Exception {
-    when(runnerBackend.run(any(), any()))
+    when(runnerBackend.run(any(), any(), any()))
         .thenReturn(RunResult.timedOut("partial", "Execution timed out"));
     RecordingDelivery delivery = new RecordingDelivery();
 
@@ -66,7 +66,7 @@ class SandboxRunServiceTest {
 
   @Test
   void backendFailureStillLeavesADurableFailedTerminal() throws Exception {
-    when(runnerBackend.run(any(), any()))
+    when(runnerBackend.run(any(), any(), any()))
         .thenThrow(new SandboxUnavailableException("Docker unavailable"));
     RecordingDelivery delivery = new RecordingDelivery();
 
@@ -79,8 +79,19 @@ class SandboxRunServiceTest {
   }
 
   @Test
+  void nullBackendResultIsPersistedAsFailedInsteadOfLeavingRunningForever() throws Exception {
+    when(runnerBackend.run(any(), any(), any())).thenReturn(null);
+    RecordingDelivery delivery = new RecordingDelivery();
+
+    AcceptedSandboxRun accepted = service.start(
+        46L, new SandboxRunRequest("print(1)", "PYTHON", null, null), delivery);
+
+    assertThat(awaitTerminal(accepted.sessionId(), delivery).getStatus()).isEqualTo("FAILED");
+  }
+
+  @Test
   void logCallbackIsBestEffortAndTerminalPersistenceIsIndependent() throws Exception {
-    when(runnerBackend.run(any(), any())).thenAnswer(inv -> {
+    when(runnerBackend.run(any(), any(), any())).thenAnswer(inv -> {
       java.util.function.Consumer<String> callback = inv.getArgument(1);
       callback.accept("line-A");
       callback.accept("line-B");

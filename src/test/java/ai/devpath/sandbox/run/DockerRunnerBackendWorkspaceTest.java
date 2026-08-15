@@ -1,59 +1,27 @@
 package ai.devpath.sandbox.run;
 
-import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assumptions.assumeTrue;
+import static org.assertj.core.api.Assertions.assertThat;
 
-import java.nio.file.FileSystems;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.attribute.PosixFilePermission;
-import java.util.Comparator;
-import java.util.Set;
-import java.util.stream.Stream;
+import java.io.ByteArrayInputStream;
+import java.nio.charset.StandardCharsets;
+import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
 import org.junit.jupiter.api.Test;
 
-/**
- * Guards the root cause of the docker IT failures: {@link Files#createTempDirectory} makes the
- * workspace owner-only (0700), which the unprivileged {@code nobody} container user cannot read
- * over the read-only bind mount on a native Linux host. This is a plain (non-{@code docker}) unit
- * test so it runs in the standard build; it is skipped on non-POSIX hosts where the contract does
- * not apply.
- */
+/** Guards remote-runner source transfer without a shared host filesystem. */
 class DockerRunnerBackendWorkspaceTest {
 
   @Test
-  void workspaceIsReadableByUnprivilegedContainerUser() throws Exception {
-    assumeTrue(
-        FileSystems.getDefault().supportedFileAttributeViews().contains("posix"),
-        "POSIX permissions are not supported on this host");
+  void sourceArchivePreservesSubmittedUtf8WithoutHostFilesystem() throws Exception {
+    byte[] bytes = DockerRunnerBackend.sourceArchive("solution.py", "print('원격_OK')");
 
-    Path workspace = DockerRunnerBackend.prepareWorkspace(99L, "solution.py", "print('OK')");
-    try {
-      Set<PosixFilePermission> dirPerms = Files.getPosixFilePermissions(workspace);
-      Set<PosixFilePermission> filePerms =
-          Files.getPosixFilePermissions(workspace.resolve("solution.py"));
-
-      assertTrue(
-          dirPerms.contains(PosixFilePermission.OTHERS_EXECUTE),
-          "workspace dir must be traversable by the container user (others-execute), was "
-              + dirPerms);
-      assertTrue(
-          filePerms.contains(PosixFilePermission.OTHERS_READ),
-          "source file must be readable by the container user (others-read), was " + filePerms);
-    } finally {
-      deleteRecursively(workspace);
-    }
-  }
-
-  private static void deleteRecursively(Path root) throws Exception {
-    try (Stream<Path> paths = Files.walk(root)) {
-      paths.sorted(Comparator.reverseOrder()).forEach(path -> {
-        try {
-          Files.deleteIfExists(path);
-        } catch (Exception ignored) {
-          // best-effort cleanup
-        }
-      });
+    try (TarArchiveInputStream archive =
+        new TarArchiveInputStream(new ByteArrayInputStream(bytes))) {
+      var source = archive.getNextEntry();
+      assertThat(source.getName()).isEqualTo("solution.py");
+      assertThat(source.getMode() & 0777).isEqualTo(0444);
+      assertThat(new String(archive.readAllBytes(), StandardCharsets.UTF_8))
+          .isEqualTo("print('원격_OK')");
+      assertThat(archive.getNextEntry()).isNull();
     }
   }
 }

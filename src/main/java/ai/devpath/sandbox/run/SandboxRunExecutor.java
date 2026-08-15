@@ -44,7 +44,7 @@ public class SandboxRunExecutor implements SmartLifecycle {
   public SandboxRunExecutor(
       @Value("${devpath.sandbox.executor.parallelism:4}") int parallelism,
       @Value("${devpath.sandbox.executor.queue-capacity:4}") int queueCapacity,
-      @Value("${devpath.sandbox.executor.drain-timeout-ms:75000}") long drainTimeoutMs,
+      @Value("${devpath.sandbox.executor.drain-timeout-ms:90000}") long drainTimeoutMs,
       MeterRegistry registry) {
     if (parallelism < 1 || queueCapacity < 0) {
       throw new IllegalArgumentException("Sandbox executor capacity must be positive");
@@ -117,6 +117,27 @@ public class SandboxRunExecutor implements SmartLifecycle {
         activeUsers.remove(userId);
       }
       throw e;
+    } finally {
+      lifecycleLock.readLock().unlock();
+    }
+  }
+
+  /** Cheap, non-reserving request-path check; submit remains the authoritative admission. */
+  public void assertCanAdmit(long userId) {
+    lifecycleLock.readLock().lock();
+    try {
+      if (!running.get()) {
+        drainingRejections.increment();
+        throw new SandboxUnavailableException("Sandbox is draining");
+      }
+      if (activeUsers.contains(userId)) {
+        userRejections.increment();
+        throw new SandboxBusyException("A Sandbox run is already active");
+      }
+      if (capacity.availablePermits() == 0) {
+        capacityRejections.increment();
+        throw new SandboxBusyException("Sandbox capacity is full");
+      }
     } finally {
       lifecycleLock.readLock().unlock();
     }

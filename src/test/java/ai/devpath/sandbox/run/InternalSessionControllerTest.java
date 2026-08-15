@@ -18,6 +18,8 @@ import org.springframework.test.web.servlet.MockMvc;
 @ActiveProfiles("test")
 class InternalSessionControllerTest {
 
+  private static final String INTERNAL_TOKEN = "test-internal-token";
+
   @Autowired MockMvc mvc;
   @Autowired SandboxSessionRepository sessions;
 
@@ -28,7 +30,7 @@ class InternalSessionControllerTest {
   }
 
   @Test
-  void returnsSessionViewWithoutAuth() throws Exception {
+  void returnsSessionViewWithWorkloadAuth() throws Exception {
     SandboxSession s = new SandboxSession();
     s.setUserId(42L);
     s.setLanguage("PYTHON");
@@ -42,7 +44,7 @@ class InternalSessionControllerTest {
     s.setStartedAt(Instant.now());
     long id = sessions.save(s).getId();
 
-    mvc.perform(get("/internal/sandbox/sessions/" + id))
+    mvc.perform(internal(get("/internal/sandbox/sessions/" + id)))
         .andExpect(status().isOk())
         .andExpect(jsonPath("$.userId").value(42))
         .andExpect(jsonPath("$.language").value("PYTHON"))
@@ -57,7 +59,7 @@ class InternalSessionControllerTest {
 
   @Test
   void missingSessionReturns404() throws Exception {
-    mvc.perform(get("/internal/sandbox/sessions/999999999"))
+    mvc.perform(internal(get("/internal/sandbox/sessions/999999999")))
         .andExpect(status().isNotFound())
         .andExpect(jsonPath("$.error.code").value("RESOURCE_NOT_FOUND"));
   }
@@ -72,8 +74,9 @@ class InternalSessionControllerTest {
     // 다른 사용자 세션은 결과에 섞이면 안 된다.
     saveSession(9999L, "other-user", Instant.parse("2026-06-24T13:00:00Z"));
 
-    mvc.perform(get("/internal/sandbox/sessions/recent")
+    mvc.perform(internal(get("/internal/sandbox/sessions/recent")
             .param("userId", String.valueOf(userId)))
+        )
         .andExpect(status().isOk())
         .andExpect(jsonPath("$.length()").value(3))
         .andExpect(jsonPath("$[0].userId").value((int) userId))
@@ -89,9 +92,9 @@ class InternalSessionControllerTest {
     saveSession(userId, "s2", Instant.parse("2026-06-24T11:00:00Z"));
     saveSession(userId, "s3", Instant.parse("2026-06-24T12:00:00Z"));
 
-    mvc.perform(get("/internal/sandbox/sessions/recent")
+    mvc.perform(internal(get("/internal/sandbox/sessions/recent")
             .param("userId", String.valueOf(userId))
-            .param("limit", "2"))
+            .param("limit", "2")))
         .andExpect(status().isOk())
         .andExpect(jsonPath("$.length()").value(2))
         .andExpect(jsonPath("$[0].submittedCode").value("s3"))
@@ -100,8 +103,8 @@ class InternalSessionControllerTest {
 
   @Test
   void recentReturnsEmptyArrayWhenNoSessions() throws Exception {
-    mvc.perform(get("/internal/sandbox/sessions/recent")
-            .param("userId", "70030001"))
+    mvc.perform(internal(get("/internal/sandbox/sessions/recent")
+            .param("userId", "70030001")))
         .andExpect(status().isOk())
         .andExpect(jsonPath("$.length()").value(0));
   }
@@ -113,11 +116,26 @@ class InternalSessionControllerTest {
       saveSession(userId, "c" + i, Instant.parse("2026-06-24T10:00:00Z").plusSeconds(i));
     }
 
-    mvc.perform(get("/internal/sandbox/sessions/recent")
+    mvc.perform(internal(get("/internal/sandbox/sessions/recent")
             .param("userId", String.valueOf(userId))
-            .param("limit", "999"))
+            .param("limit", "999")))
         .andExpect(status().isOk())
         .andExpect(jsonPath("$.length()").value(20));
+  }
+
+  @Test
+  void internalApiRejectsMissingAndWrongWorkloadTokens() throws Exception {
+    mvc.perform(get("/internal/sandbox/sessions/recent").param("userId", "1"))
+        .andExpect(status().isUnauthorized());
+    mvc.perform(get("/internal/sandbox/sessions/recent")
+            .header("X-DevPath-Internal-Token", "wrong")
+            .param("userId", "1"))
+        .andExpect(status().isUnauthorized());
+  }
+
+  private static org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder internal(
+      org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder request) {
+    return request.header("X-DevPath-Internal-Token", INTERNAL_TOKEN);
   }
 
   private void saveSession(long userId, String code, Instant startedAt) {

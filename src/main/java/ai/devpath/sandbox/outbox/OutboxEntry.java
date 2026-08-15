@@ -21,6 +21,7 @@ public class OutboxEntry {
   @JdbcTypeCode(SqlTypes.JSON) @Column(nullable = false) private String payload;
   @Column(name = "created_at", nullable = false) private Instant createdAt;
   @Column(name = "published_at") private Instant publishedAt;
+  @Column(name = "dedupe_key") private String dedupeKey;
 
   public Long getId() { return id; }
   public String getAggregateType() { return aggregateType; }
@@ -35,4 +36,6 @@ public class OutboxEntry {
   public void setCreatedAt(Instant v) { this.createdAt = v; }
   public Instant getPublishedAt() { return publishedAt; }
   public void setPublishedAt(Instant v) { this.publishedAt = v; }
+  public String getDedupeKey() { return dedupeKey; }
+  public void setDedupeKey(String v) { this.dedupeKey = v; }
 }

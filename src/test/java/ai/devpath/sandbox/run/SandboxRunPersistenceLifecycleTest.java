@@ -37,8 +37,10 @@ class SandboxRunPersistenceLifecycleTest {
         501L, new SandboxRunRequest("print(1)", "PYTHON", 10L, 20L));
 
     assertThat(allocated.getId()).isNotNull();
-    assertThat(sessions.findById(allocated.getId()).orElseThrow().getStatus())
-        .isEqualTo("ALLOCATING");
+    SandboxSession durable = sessions.findById(allocated.getId()).orElseThrow();
+    assertThat(durable.getStatus()).isEqualTo("ALLOCATING");
+    assertThat(durable.getOwnerInstance()).isNotBlank();
+    assertThat(durable.getLeaseExpiresAt()).isAfter(Instant.now());
 
     persistence.markRunning(allocated.getId());
 
@@ -181,6 +183,103 @@ class SandboxRunPersistenceLifecycleTest {
 
     assertThat(reconciled).isZero();
     assertThat(sessions.findById(id).orElseThrow().getStatus()).isEqualTo("RUNNING");
+  }
+
+  @Test
+  void accurateTerminalFallbackIsRepairedToExactlyOneOutboxRow() {
+    SandboxSession allocated = persistence.allocate(
+        507L, new SandboxRunRequest("loop", "PYTHON", null, null));
+    persistence.markRunning(allocated.getId());
+    RunResult actual = new RunResult(
+        SandboxTerminalStatus.TIMED_OUT, -1, "partial", "deadline", 29_000L, 128, true);
+
+    persistence.finishWithoutEvent(allocated.getId(), actual);
+
+    assertThat(outbox.findTop100ByPublishedAtIsNullOrderByCreatedAtAsc()).isEmpty();
+    assertThat(persistence.repairMissingTerminalEvents(25)).isEqualTo(1);
+    assertThat(persistence.repairMissingTerminalEvents(25)).isZero();
+    SandboxSession terminal = sessions.findById(allocated.getId()).orElseThrow();
+    assertThat(terminal.getStatus()).isEqualTo("TIMED_OUT");
+    assertThat(terminal.getStdout()).isEqualTo("partial");
+    assertThat(terminal.getStderr()).isEqualTo("deadline");
+    assertThat(terminal.getCpuMsUsed()).isEqualTo(29_000L);
+    assertThat(terminal.getMemoryMbPeak()).isEqualTo(128);
+    assertThat(terminal.isOutputTruncated()).isTrue();
+    assertThat(outbox.findTop100ByPublishedAtIsNullOrderByCreatedAtAsc()).hasSize(1);
+  }
+
+  @Test
+  void liveFortySecondRunIsNotKilledWhileItsIndependentLeaseIsValid() {
+    SandboxSession session = new SandboxSession();
+    session.setUserId(604L);
+    session.setLanguage("PYTHON");
+    session.setSubmittedCode("still-running-after-40s");
+    session.setStatus("RUNNING");
+    session.setOwnerInstance("pod-a");
+    session.setLeaseExpiresAt(Instant.now().plusSeconds(10));
+    session.setStartedAt(Instant.now().minusSeconds(40));
+    session.setUpdatedAt(Instant.now().minusSeconds(40));
+    long id = sessions.saveAndFlush(session).getId();
+
+    int reconciled = persistence.reconcileExpired(
+        Instant.now(), Instant.now().minusSeconds(35), 25);
+
+    assertThat(reconciled).isZero();
+    assertThat(sessions.findById(id).orElseThrow().getStatus()).isEqualTo("RUNNING");
+  }
+
+  @Test
+  void expiredLeaseIsRecoveredEvenWhenUpdatedAtWasRecentlyTouched() {
+    SandboxSession session = new SandboxSession();
+    session.setUserId(605L);
+    session.setLanguage("PYTHON");
+    session.setSubmittedCode("lost-process");
+    session.setStatus("RUNNING");
+    session.setOwnerInstance("dead-pod");
+    session.setLeaseExpiresAt(Instant.now().minusSeconds(1));
+    session.setStartedAt(Instant.now().minusSeconds(20));
+    session.setUpdatedAt(Instant.now());
+    long id = sessions.saveAndFlush(session).getId();
+
+    int reconciled = persistence.reconcileExpired(
+        Instant.now(), Instant.now().minusSeconds(35), 25);
+
+    assertThat(reconciled).isEqualTo(1);
+    assertThat(sessions.findById(id).orElseThrow().getStatus()).isEqualTo("KILLED");
+  }
+
+  @Test
+  void reconciliationBatchSkipsRowsLockedByAnotherWorker() throws Exception {
+    SandboxSession session = new SandboxSession();
+    session.setUserId(606L);
+    session.setLanguage("PYTHON");
+    session.setSubmittedCode("owned-by-other-reconciler");
+    session.setStatus("RUNNING");
+    session.setOwnerInstance("dead-pod");
+    session.setLeaseExpiresAt(Instant.now().minusSeconds(1));
+    long id = sessions.saveAndFlush(session).getId();
+
+    try (var lock = dataSource.getConnection()) {
+      lock.setAutoCommit(false);
+      try (var statement = lock.prepareStatement(
+          "SELECT id FROM sandbox_sessions WHERE id = ? FOR UPDATE")) {
+        statement.setLong(1, id);
+        statement.executeQuery().next();
+
+        long started = System.nanoTime();
+        int reconciled = persistence.reconcileExpired(
+            Instant.now(), Instant.now().minusSeconds(35), 25);
+        long elapsedMs = (System.nanoTime() - started) / 1_000_000;
+
+        assertThat(reconciled).isZero();
+        assertThat(elapsedMs).isLessThan(250L);
+      } finally {
+        lock.rollback();
+      }
+    }
+
+    assertThat(persistence.reconcileExpired(
+        Instant.now(), Instant.now().minusSeconds(35), 25)).isEqualTo(1);
   }
 
   private long saveStale(long userId, String status) {

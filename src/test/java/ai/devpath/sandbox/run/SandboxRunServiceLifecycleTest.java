@@ -32,8 +32,10 @@ class SandboxRunServiceLifecycleTest {
       throws Exception {
     SandboxRunPersistenceService persistence = mock(SandboxRunPersistenceService.class);
     RunnerBackend backend = mock(RunnerBackend.class);
-    executor = new SandboxRunExecutor(1, 1, 2_000, new SimpleMeterRegistry());
-    SandboxRunService service = new SandboxRunService(persistence, backend, executor);
+    SimpleMeterRegistry metrics = new SimpleMeterRegistry();
+    executor = new SandboxRunExecutor(1, 1, 2_000, metrics);
+    SandboxTerminalFinalizer finalizer = new SandboxTerminalFinalizer(persistence, metrics, 3);
+    SandboxRunService service = new SandboxRunService(persistence, backend, executor, finalizer);
     SandboxSession allocated = mock(SandboxSession.class);
     SandboxSession terminal = mock(SandboxSession.class);
     when(allocated.getId()).thenReturn(91L);
@@ -41,7 +43,10 @@ class SandboxRunServiceLifecycleTest {
     when(persistence.markRunning(91L)).thenReturn(true);
     CountDownLatch runnerStarted = new CountDownLatch(1);
     CountDownLatch releaseRunner = new CountDownLatch(1);
-    when(backend.run(any(), any())).thenAnswer(inv -> {
+    when(persistence.attachContainer(91L, "container-91")).thenReturn(true);
+    when(backend.run(any(), any(), any())).thenAnswer(inv -> {
+      java.util.function.Consumer<String> containerCreated = inv.getArgument(2);
+      containerCreated.accept("container-91");
       runnerStarted.countDown();
       releaseRunner.await();
       return new RunResult(0, "ok", "", null, null);
@@ -67,7 +72,8 @@ class SandboxRunServiceLifecycleTest {
     InOrder order = inOrder(persistence, backend);
     order.verify(persistence).allocate(anyLong(), any());
     order.verify(persistence).markRunning(91L);
-    order.verify(backend).run(any(), any());
+    order.verify(backend).run(any(), any(), any());
+    order.verify(persistence).attachContainer(91L, "container-91");
     order.verify(persistence).finish(anyLong(), any());
   }
 }

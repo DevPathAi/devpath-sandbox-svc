@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -75,6 +76,24 @@ class RunControllerTest {
             .content("{\"code\":\"print(1)\",\"language\":\"PYTHON\"}"))
         .andExpect(status().isServiceUnavailable());
 
+    verify(sandboxRunService, never()).start(anyLong(), any(), any());
+    var order = inOrder(sandboxRunService);
+    order.verify(sandboxRunService).assertCanAdmit(42L);
+    order.verify(sandboxRunService).isRunnerAvailable();
+  }
+
+  @Test
+  void cheapAdmissionRejectionSkipsCachedRunnerHealthLookup() throws Exception {
+    org.mockito.Mockito.doThrow(new SandboxBusyException("active"))
+        .when(sandboxRunService).assertCanAdmit(43L);
+
+    mvc.perform(post("/sandbox/run")
+            .with(jwt().jwt(j -> j.subject("43")))
+            .contentType(MediaType.APPLICATION_JSON)
+            .content("{\"code\":\"print(1)\",\"language\":\"PYTHON\"}"))
+        .andExpect(status().isTooManyRequests());
+
+    verify(sandboxRunService, never()).isRunnerAvailable();
     verify(sandboxRunService, never()).start(anyLong(), any(), any());
   }
 

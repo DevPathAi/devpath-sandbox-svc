@@ -1,6 +1,7 @@
 package ai.devpath.sandbox.run;
 
 import java.util.concurrent.atomic.AtomicReference;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 /** Orchestrates accepted runs without letting SSE delivery control execution persistence. */
@@ -10,18 +11,41 @@ public class SandboxRunService {
   private final SandboxRunPersistenceService persistence;
   private final RunnerBackend runnerBackend;
   private final SandboxRunExecutor executor;
+  private final SandboxTerminalFinalizer terminalFinalizer;
+  private final SandboxRunnerHealthIndicator runnerHealth;
 
+  @Autowired
   public SandboxRunService(
       SandboxRunPersistenceService persistence,
       RunnerBackend runnerBackend,
-      SandboxRunExecutor executor) {
+      SandboxRunExecutor executor,
+      SandboxTerminalFinalizer terminalFinalizer,
+      SandboxRunnerHealthIndicator runnerHealth) {
     this.persistence = persistence;
     this.runnerBackend = runnerBackend;
     this.executor = executor;
+    this.terminalFinalizer = terminalFinalizer;
+    this.runnerHealth = runnerHealth;
+  }
+
+  SandboxRunService(
+      SandboxRunPersistenceService persistence,
+      RunnerBackend runnerBackend,
+      SandboxRunExecutor executor,
+      SandboxTerminalFinalizer terminalFinalizer) {
+    this.persistence = persistence;
+    this.runnerBackend = runnerBackend;
+    this.executor = executor;
+    this.terminalFinalizer = terminalFinalizer;
+    this.runnerHealth = null;
   }
 
   public boolean isRunnerAvailable() {
-    return runnerBackend.isAvailable();
+    return runnerHealth == null ? runnerBackend.isAvailable() : runnerHealth.isAvailable();
+  }
+
+  public void assertCanAdmit(long userId) {
+    executor.assertCanAdmit(userId);
   }
 
   /** Returns only after ALLOCATING is committed and the execution task is admitted. */
@@ -58,7 +82,15 @@ public class SandboxRunService {
     try {
       result = runnerBackend.run(
           new RunSpec(request.code(), request.language(), sessionId),
-          line -> deliver(() -> delivery.log(line)));
+          line -> deliver(() -> delivery.log(line)),
+          containerId -> {
+            if (!persistence.attachContainer(sessionId, containerId)) {
+              throw new SandboxUnavailableException("Sandbox session is already terminal");
+            }
+          });
+      if (result == null) {
+        throw new SandboxUnavailableException("Sandbox runner returned no result");
+      }
     } catch (RuntimeException runnerFailure) {
       SandboxTerminalStatus status = Thread.currentThread().isInterrupted()
           ? SandboxTerminalStatus.KILLED
@@ -68,11 +100,12 @@ public class SandboxRunService {
     }
 
     try {
-      SandboxSession terminal = persistence.finish(sessionId, SandboxOutputLimits.limit(result));
+      SandboxSession terminal = terminalFinalizer.finish(
+          sessionId, SandboxOutputLimits.limit(result));
       executor.recordTerminal(terminal);
       deliver(() -> delivery.result(SandboxTerminalEvent.from(terminal)));
     } catch (RuntimeException persistenceFailure) {
-      // Reconciliation owns a RUNNING row whose terminal transaction could not commit.
+      // SandboxTerminalFinalizer retains the exact RunResult for background retry.
     } finally {
       deliver(delivery::complete);
     }

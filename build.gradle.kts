@@ -8,6 +8,9 @@ group = "ai.devpath"
 version = "0.0.1-SNAPSHOT"
 description = "DevPath AI isolated sandbox runner (Docker + gVisor)"
 
+val devpathSharedVersion = providers.gradleProperty("devpathSharedVersion").get()
+val devpathSharedCoordinate = "ai.devpath:devpath-shared:$devpathSharedVersion"
+
 java {
 	toolchain {
 		languageVersion = JavaLanguageVersion.of(21)
@@ -15,6 +18,9 @@ java {
 }
 
 repositories {
+	providers.gradleProperty("immutableSharedRepository").orNull?.let { repository ->
+		maven { url = uri(repository) }
+	}
 	mavenCentral()
 	maven {
 		url = uri("https://maven.pkg.github.com/DevPathAi/devpath-shared")
@@ -34,7 +40,7 @@ dependencies {
 	implementation("org.springframework.boot:spring-boot-starter-oauth2-resource-server")
 	implementation("org.springframework.kafka:spring-kafka")
 	implementation("org.springframework.boot:spring-boot-kafka")
-	implementation("ai.devpath:devpath-shared:0.0.1-et8.20260816")
+	implementation(devpathSharedCoordinate)
 	implementation("com.github.docker-java:docker-java-core:3.5.1")
 	implementation("com.github.docker-java:docker-java-transport-httpclient5:3.5.1")
 	implementation("org.apache.commons:commons-compress")

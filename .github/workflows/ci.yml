@@ -34,7 +34,7 @@ jobs:
         with:
           repository: DevPathAi/devpath-shared
           ref: 96a5cdb9d95689759afb229b4d1e29b9bd221793
-          path: .ci/devpath-shared
+          path: .ci/devpath-shared-final
       - name: Checkout immutable ET8 migration checkpoint
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -53,7 +53,7 @@ jobs:
           java-version: 21
       - uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
       - name: Validate published history, ET8 checkpoint, and final shared lineage
-        run: ./gradlew test --tests "ai.devpath.sandbox.SharedMigrationUpgradePathTest"
+        run: ./gradlew test --tests "ai.devpath.sandbox.SharedMigrationUpgradePathTest" "-PdevpathSharedDir=${{ github.workspace }}/.ci/devpath-shared-final"
         env:
           HISTORICAL_SHARED_MIGRATIONS: ${{ github.workspace }}/.ci/devpath-shared-history/src/main/resources/db/migration
           ET8_SHARED_MIGRATIONS: ${{ github.workspace }}/.ci/devpath-shared-et8/src/main/resources/db/migration
@@ -63,7 +63,7 @@ jobs:
           DB_PASSWORD: localdev
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - run: ./gradlew build "-Dgroups=!docker"
+      - run: ./gradlew --refresh-dependencies build "-Dgroups=!docker"
         env:
           DB_URL: jdbc:postgresql://localhost:5432/devpath
           DB_USER: devpath

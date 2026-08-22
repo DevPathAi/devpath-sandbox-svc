@@ -25,6 +25,39 @@
 
 로컬에서 gVisor 없이 개발할 때는 일반 Docker 런타임으로 폴백합니다 (프로덕션은 runsc 필수).
 
+## 실행 세션과 복구 계약
+
+`POST /sandbox/run`은 전역/사용자별 admission을 통과한 뒤 `ALLOCATING` 세션을 먼저
+커밋합니다. 응답의 `X-Sandbox-Session-Id`와 기존 numeric `session` SSE 이벤트는 같은
+안정적인 ID를 제공합니다. 이 ID를 받은 인증 사용자는
+`GET /sandbox/sessions/{sessionId}`로 `ALLOCATING`, `RUNNING`, terminal 상태와 저장된
+출력 절단 여부를 복구할 수 있습니다.
+
+새 소비자는 요청 헤더 `X-Sandbox-Event-Version: 2`를 보내 terminal `result` 이벤트를
+opt-in합니다. 기존 소비자는 numeric `session`과 `log` 이벤트를 그대로 받고 JSON result를
+로그로 오인하지 않습니다. terminal 상태는 `COMPLETED`, `FAILED`, `KILLED`, `TIMED_OUT`이며,
+SSE 연결 종료는 실행 상태가 아닙니다.
+
+현재 요청 계약에는 `clientRunId`가 없습니다. 따라서 응답 헤더나 numeric session 이벤트를
+받기 전에 연결이 사라진 accepted request는 클라이언트 요청과 **cannot be correlated** 합니다.
+이 경우를 멱등 복구됐다고 표현하면 안 됩니다. 같은 사용자의 즉시 재시도는 원래 실행이
+활성인 동안 `SANDBOX_BUSY`를 받을 수 있고, session ID를 하나라도 받은 경우에만 owner GET
+복구가 가능합니다.
+
+출력은 stdout/stderr 합산 UTF-8 256 KiB, SSE 이벤트당 16 KiB로 제한됩니다. 실행과 terminal
+outbox 저장은 SSE 전송과 독립적이며, 느리거나 끊긴 클라이언트는 실행을 취소하지 않습니다.
+
+## Mentor 최근 실행 metadata 계약
+
+`GET /internal/sandbox/sessions/recent/metadata`는 workload token을 요구하며 응답 항목을
+정확히 `language`, `status` 두 필드로 제한합니다. 조회도 같은 두 DB 컬럼만 projection하여
+제출 코드와 stdout/stderr를 LCS 경계로 보내지 않습니다. 기존 `/recent`는 AI 등 기존 소비자의
+full-session 계약이므로 응답을 축소하지 않습니다.
+
+배포는 Sandbox producer를 먼저 올리고 새 endpoint의 readiness를 확인한 다음 LCS consumer를
+전환합니다. 구 consumer가 모두 전환되기 전에는 `/recent`를 제거하지 않으며, LCS는 새 endpoint
+실패 시 구 raw endpoint로 fallback하지 않습니다.
+
 ## 개발 규칙
 
 - Git 규칙: [documents/09_Git_규칙_정의서](https://github.com/DevPathAi/documents/blob/main/09_Git_규칙_정의서.md)

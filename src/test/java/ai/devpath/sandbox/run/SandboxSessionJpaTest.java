@@ -30,6 +30,7 @@ class SandboxSessionJpaTest {
     session.setExitCode(0);
     session.setCpuMsUsed(12L);
     session.setMemoryMbPeak(34);
+    session.setOutputTruncated(true);
     session.setStartedAt(Instant.now());
     session.setFinishedAt(Instant.now());
 
@@ -41,6 +42,7 @@ class SandboxSessionJpaTest {
     assertEquals("PYTHON", found.getLanguage());
     assertEquals("COMPLETED", found.getStatus());
     assertEquals(0, found.getExitCode());
+    assertEquals(true, found.isOutputTruncated());
     assertNotNull(found.getCreatedAt());
     assertNotNull(found.getUpdatedAt());
   }

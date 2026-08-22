@@ -1,39 +1,188 @@
 package ai.devpath.sandbox.run;
 
-import java.util.function.Consumer;
+import java.util.concurrent.atomic.AtomicReference;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
-/**
- * 샌드박스 실행 오케스트레이션.
- * 세션 생성/이벤트/결과 영속은 짧은 @Transactional(SandboxRunPersistenceService),
- * 컨테이너 실행(최대 30s)은 트랜잭션 밖에서 수행해 DB 커넥션을 장기 점유하지 않는다.
- */
+/** Orchestrates accepted runs without letting SSE delivery control execution persistence. */
 @Service
 public class SandboxRunService {
 
   private final SandboxRunPersistenceService persistence;
   private final RunnerBackend runnerBackend;
+  private final SandboxRunExecutor executor;
+  private final SandboxTerminalFinalizer terminalFinalizer;
+  private final SandboxRunnerHealthIndicator runnerHealth;
 
-  public SandboxRunService(SandboxRunPersistenceService persistence,
-      RunnerBackend runnerBackend) {
+  @Autowired
+  public SandboxRunService(
+      SandboxRunPersistenceService persistence,
+      RunnerBackend runnerBackend,
+      SandboxRunExecutor executor,
+      SandboxTerminalFinalizer terminalFinalizer,
+      SandboxRunnerHealthIndicator runnerHealth) {
     this.persistence = persistence;
     this.runnerBackend = runnerBackend;
+    this.executor = executor;
+    this.terminalFinalizer = terminalFinalizer;
+    this.runnerHealth = runnerHealth;
   }
 
-  /**
-   * runner 가용성(예: Docker 데몬). RunController가 SSE 시작 전에 호출해
-   * 불가 시 세션·이벤트를 생성하지 않고 503으로 빠르게 종료한다.
-   */
+  SandboxRunService(
+      SandboxRunPersistenceService persistence,
+      RunnerBackend runnerBackend,
+      SandboxRunExecutor executor,
+      SandboxTerminalFinalizer terminalFinalizer) {
+    this.persistence = persistence;
+    this.runnerBackend = runnerBackend;
+    this.executor = executor;
+    this.terminalFinalizer = terminalFinalizer;
+    this.runnerHealth = null;
+  }
+
   public boolean isRunnerAvailable() {
-    return runnerBackend.isAvailable();
+    return runnerHealth == null ? runnerBackend.isAvailable() : runnerHealth.isAvailable();
   }
 
-  public SandboxSession execute(long userId, SandboxRunRequest req, Consumer<String> logCallback) {
-    SandboxSession session = persistence.createRunning(userId, req);
+  public void assertCanAdmit(long userId) {
+    executor.assertCanAdmit(userId);
+    terminalFinalizer.assertCanReserve();
+  }
 
-    RunResult result = runnerBackend.run(
-        new RunSpec(req.code(), req.language(), session.getId()), logCallback);
+  /** Returns only after ALLOCATING is committed and the execution task is admitted. */
+  public AcceptedSandboxRun start(
+      long userId,
+      SandboxRunRequest request,
+      SandboxRunDelivery delivery) {
+    AtomicReference<AcceptedSandboxRun> accepted = new AtomicReference<>();
+    executor.submit(userId, () -> {
+      SandboxTerminalFinalizer.Reservation reservation = terminalFinalizer.reserve();
+      try {
+        SandboxSession session = persistence.allocate(userId, request);
+        long sessionId = session.getId();
+        accepted.set(new AcceptedSandboxRun(sessionId));
+        deliver(() -> delivery.session(sessionId));
+        return new AcceptedRunWork(sessionId, request, delivery, reservation);
+      } catch (RuntimeException | Error failure) {
+        reservation.close();
+        throw failure;
+      }
+    });
+    return accepted.get();
+  }
 
-    return persistence.finish(session, result);
+  private void executeAccepted(
+      long sessionId,
+      SandboxRunRequest request,
+      SandboxRunDelivery delivery,
+      SandboxTerminalFinalizer.Reservation reservation) {
+    try {
+      if (!persistence.markRunning(sessionId)) {
+        reservation.close();
+        deliver(delivery::complete);
+        return;
+      }
+    } catch (RuntimeException persistenceFailure) {
+      finalizeResult(
+          sessionId,
+          killedResult(),
+          delivery,
+          reservation);
+      return;
+    }
+
+    RunResult result;
+    try {
+      result = runnerBackend.run(
+          new RunSpec(request.code(), request.language(), sessionId),
+          line -> deliver(() -> delivery.log(line)),
+          containerId -> {
+            if (!persistence.attachContainer(sessionId, containerId)) {
+              throw new SandboxUnavailableException("Sandbox session is already terminal");
+            }
+          });
+      if (result == null) {
+        throw new SandboxUnavailableException("Sandbox runner returned no result");
+      }
+    } catch (SandboxRunnerExecutionException runnerFailure) {
+      result = runnerFailure.result();
+    } catch (RuntimeException runnerFailure) {
+      SandboxTerminalStatus status = Thread.currentThread().isInterrupted()
+          ? SandboxTerminalStatus.KILLED
+          : SandboxTerminalStatus.FAILED;
+      int exitCode = status == SandboxTerminalStatus.KILLED ? -1 : 1;
+      result = new RunResult(status, exitCode, "", "", null, null, false);
+    }
+
+    finalizeResult(sessionId, result, delivery, reservation);
+  }
+
+  private void finalizeResult(
+      long sessionId,
+      RunResult result,
+      SandboxRunDelivery delivery,
+      SandboxTerminalFinalizer.Reservation reservation) {
+    try {
+      SandboxSession terminal = terminalFinalizer.finish(
+          sessionId, SandboxOutputLimits.limit(result), reservation);
+      executor.recordTerminal(terminal);
+      deliver(() -> delivery.result(SandboxTerminalEvent.from(terminal)));
+    } catch (RuntimeException persistenceFailure) {
+      // SandboxTerminalFinalizer retains the exact RunResult for background retry.
+    } finally {
+      deliver(delivery::complete);
+    }
+  }
+
+  private static RunResult killedResult() {
+    return new RunResult(
+        SandboxTerminalStatus.KILLED, -1, "", "", null, null, false);
+  }
+
+  private static void deliver(Runnable action) {
+    try {
+      action.run();
+    } catch (RuntimeException ignored) {
+      // Delivery is best-effort and cannot cancel or relabel an accepted execution.
+    }
+  }
+
+  private final class AcceptedRunWork implements SandboxRunExecutor.CancelableWork {
+    private final long sessionId;
+    private final SandboxRunRequest request;
+    private final SandboxRunDelivery delivery;
+    private final SandboxTerminalFinalizer.Reservation reservation;
+    private final java.util.concurrent.atomic.AtomicBoolean claimed =
+        new java.util.concurrent.atomic.AtomicBoolean();
+
+    private AcceptedRunWork(
+        long sessionId,
+        SandboxRunRequest request,
+        SandboxRunDelivery delivery,
+        SandboxTerminalFinalizer.Reservation reservation) {
+      this.sessionId = sessionId;
+      this.request = request;
+      this.delivery = delivery;
+      this.reservation = reservation;
+    }
+
+    @Override
+    public void run() {
+      if (claimed.compareAndSet(false, true)) {
+        executeAccepted(sessionId, request, delivery, reservation);
+      }
+    }
+
+    @Override
+    public void cancelBeforeStart() {
+      if (claimed.compareAndSet(false, true)) {
+        finalizeResult(sessionId, killedResult(), delivery, reservation);
+      }
+    }
+
+    @Override
+    public void cancelRunning() {
+      runnerBackend.cancel(sessionId);
+    }
   }
 }

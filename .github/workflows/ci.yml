@@ -7,13 +7,13 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: read
     services:
       postgres:
-        image: pgvector/pgvector:pg17
+        image: pgvector/pgvector:pg17@sha256:cf134a767f474095eeba57e0117be8e568e011a63f33fbf252f14c9b760f8e6f
         env:
           POSTGRES_USER: devpath
           POSTGRES_PASSWORD: localdev
@@ -26,12 +26,43 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-java@v5
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - name: Verify immutable image producer contracts
+        run: node --test .github/scripts/*.test.mjs
+      - name: Checkout immutable shared contract
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: DevPathAi/devpath-shared
+          ref: 96a5cdb9d95689759afb229b4d1e29b9bd221793
+          path: .ci/devpath-shared-final
+      - name: Checkout immutable ET8 migration checkpoint
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: DevPathAi/devpath-shared
+          ref: 2b03c38934fdd19332da59107e4330a3af92d078
+          path: .ci/devpath-shared-et8
+      - name: Checkout historical published migration lineage
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: DevPathAi/devpath-shared
+          ref: 78e2c6150644f81eff9af9664253ff0b9039f927
+          path: .ci/devpath-shared-history
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
         with:
           distribution: temurin
           java-version: 21
-      - uses: gradle/actions/setup-gradle@v6
+      - uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
+      - name: Validate published history, ET8 checkpoint, and final shared lineage
+        run: ./gradlew test --tests "ai.devpath.sandbox.SharedMigrationUpgradePathTest" "-PdevpathSharedDir=${{ github.workspace }}/.ci/devpath-shared-final"
+        env:
+          HISTORICAL_SHARED_MIGRATIONS: ${{ github.workspace }}/.ci/devpath-shared-history/src/main/resources/db/migration
+          ET8_SHARED_MIGRATIONS: ${{ github.workspace }}/.ci/devpath-shared-et8/src/main/resources/db/migration
+          FINAL_SHARED_VERSION: 202608161011
+          DB_URL: jdbc:postgresql://localhost:5432/devpath
+          DB_USER: devpath
+          DB_PASSWORD: localdev
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - run: ./gradlew --refresh-dependencies build "-Dgroups=!docker"
         env:
           DB_URL: jdbc:postgresql://localhost:5432/devpath
@@ -39,77 +70,295 @@ jobs:
           DB_PASSWORD: localdev
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Pull sandbox runtime images
+      - name: Bind exact sandbox runtime images to local aliases
+        shell: bash
         run: |
-          docker pull eclipse-temurin:21-jdk
-          docker pull node:20-alpine
-          docker pull python:3.12-slim
-      - run: ./gradlew --refresh-dependencies test "-Dgroups=docker"
+          set -euo pipefail
+          docker pull eclipse-temurin:21-jdk@sha256:57865c22b954cf920cb05a610af81d577e89783282514ba071e99c7357f6c769
+          java_source_id="$(docker image inspect eclipse-temurin:21-jdk@sha256:57865c22b954cf920cb05a610af81d577e89783282514ba071e99c7357f6c769 --format '{{.Id}}')"
+          [[ "${java_source_id}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          docker tag eclipse-temurin:21-jdk@sha256:57865c22b954cf920cb05a610af81d577e89783282514ba071e99c7357f6c769 eclipse-temurin:21-jdk
+          java_alias_id="$(docker image inspect eclipse-temurin:21-jdk --format '{{.Id}}')"
+          test "${java_alias_id}" = "${java_source_id}"
+          docker pull node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293
+          node_source_id="$(docker image inspect node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293 --format '{{.Id}}')"
+          [[ "${node_source_id}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          docker tag node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293 node:20-alpine
+          node_alias_id="$(docker image inspect node:20-alpine --format '{{.Id}}')"
+          test "${node_alias_id}" = "${node_source_id}"
+          docker pull python:3.12-slim@sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a
+          python_source_id="$(docker image inspect python:3.12-slim@sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a --format '{{.Id}}')"
+          [[ "${python_source_id}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          docker tag python:3.12-slim@sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a python:3.12-slim
+          python_alias_id="$(docker image inspect python:3.12-slim --format '{{.Id}}')"
+          test "${python_alias_id}" = "${python_source_id}"
+      - run: ./gradlew test "-Dgroups=docker"
         env:
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Verify exact bootJar output
+        id: boot-jar
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -d '' jars < <(find build/libs -maxdepth 1 -type f -name '*-SNAPSHOT.jar' ! -name '*-plain.jar' -print0)
+          test "${#jars[@]}" -eq 1
+          test -s "${jars[0]}"
+          echo "path=${jars[0]}" >>"${GITHUB_OUTPUT}"
+      - name: Preserve exact bootJar input
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: devpath-sandbox-svc-boot-jar-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.boot-jar.outputs.path }}
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 1
+
   image:
     needs: build
-    if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'DevPathAi/devpath-sandbox-svc'
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
+    concurrency:
+      group: devpath-sandbox-svc-immutable-image-${{ github.sha }}
+      cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-java@v5
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - name: Enforce exact protected-main producer identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ github.event_name }}" = "push"
+          test "${{ github.ref }}" = "refs/heads/main"
+          test "${{ github.repository }}" = "DevPathAi/devpath-sandbox-svc"
+          test "${{ github.run_attempt }}" = "1"
+          test "$(git rev-parse HEAD)" = "${{ github.sha }}"
+      - name: Download exact bootJar input
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
-          distribution: temurin
-          java-version: 21
-      - uses: gradle/actions/setup-gradle@v6
-      - run: ./gradlew --refresh-dependencies bootJar
-        env:
-          GITHUB_ACTOR: ${{ github.actor }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/login-action@v4
+          name: devpath-sandbox-svc-boot-jar-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: build/libs
+      - name: Verify exact downloaded bootJar
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -d '' jars < <(find build/libs -maxdepth 1 -type f -name '*-SNAPSHOT.jar' ! -name '*-plain.jar' -print0)
+          test "${#jars[@]}" -eq 1
+          test -s "${jars[0]}"
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        with:
+          version: v0.34.1
+          driver-opts: >-
+            image=moby/buildkit:v0.30.0@sha256:0168606be2315b7c807a03b3d8aa79beefdb31c98740cebdffdfeebf31190c9f
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v7
+      - name: Inspect immutable source tag before build
+        id: immutable-tag
+        env:
+          IMAGE_REPOSITORY: ghcr.io/devpathai/devpath-sandbox-svc
+          IMAGE_TAG: ${{ github.sha }}
+          SOURCE_SHA: ${{ github.sha }}
+          EXPECTED_OCI_SOURCE: https://github.com/DevPathAi/devpath-sandbox-svc
+          REGISTRY_USERNAME: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: node .github/scripts/immutable-image-registry.mjs --allow-absent
+      - name: Build exact local image candidate
+        id: candidate
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
-          push: true
-          tags: |
-            ghcr.io/devpathai/devpath-sandbox-svc:${{ github.sha }}
-            ghcr.io/devpathai/devpath-sandbox-svc:main
-
-  deploy:
-    needs: image
-    if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/create-github-app-token@v3
-        id: app-token
-        with:
-          app-id: ${{ secrets.GITOPS_APP_ID }}
-          private-key: ${{ secrets.GITOPS_APP_PRIVATE_KEY }}
-          owner: DevPathAi
-          repositories: devpath-gitops
-      - uses: actions/checkout@v6
-        with:
-          repository: DevPathAi/devpath-gitops
-          token: ${{ steps.app-token.outputs.token }}
-          path: gitops
-      - name: Install kustomize
+          push: false
+          platforms: linux/amd64
+          provenance: false
+          build-args: SOURCE_DATE_EPOCH=1
+          outputs: >-
+            type=docker,dest=${{ runner.temp }}/devpath-sandbox-svc-candidate.tar,rewrite-timestamp=true
+          tags: devpath-sandbox-svc-candidate:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Verify local candidate identity
+        id: candidate-identity
+        env:
+          CANDIDATE_ARCHIVE: ${{ runner.temp }}/devpath-sandbox-svc-candidate.tar
+          CANDIDATE_REFERENCE: devpath-sandbox-svc-candidate:${{ github.sha }}
+          SOURCE_SHA: ${{ github.sha }}
+          EXPECTED_OCI_SOURCE: https://github.com/DevPathAi/devpath-sandbox-svc
         run: |
-          curl -sLo kustomize.tar.gz https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.4.3/kustomize_v5.4.3_linux_amd64.tar.gz
-          tar -xzf kustomize.tar.gz && sudo mv kustomize /usr/local/bin/
-      - name: set image to commit SHA
-        working-directory: gitops/apps/devpath-sandbox-svc/base
-        run: kustomize edit set image ghcr.io/devpathai/devpath-sandbox-svc=ghcr.io/devpathai/devpath-sandbox-svc:${{ github.sha }}
-      - name: commit & push
-        working-directory: gitops
+          set -euo pipefail
+          test -s "${CANDIDATE_ARCHIVE}"
+          archive_entries="$(tar -tf "${CANDIDATE_ARCHIVE}")"
+          test -n "${archive_entries}"
+          test "$(LC_ALL=C sort <<<"${archive_entries}" | uniq -d | wc -l)" = 0
+          if grep -Ev '^(blobs/|blobs/sha256/|blobs/sha256/[0-9a-f]{64}|index.json|manifest.json|oci-layout)$' \
+              <<<"${archive_entries}"; then
+            echo "Candidate archive contains an unexpected path" >&2
+            exit 1
+          fi
+          archive_manifest="$(tar -xOf "${CANDIDATE_ARCHIVE}" manifest.json)"
+          jq -e --arg tag "${CANDIDATE_REFERENCE}" '
+            length == 1 and
+            .[0].RepoTags == [$tag] and
+            (.[0].Config | test("^blobs/sha256/[0-9a-f]{64}$")) and
+            (.[0].Layers | type) == "array" and
+            (.[0].Layers | length) > 0 and
+            all(.[0].Layers[]; test("^blobs/sha256/[0-9a-f]{64}$"))
+          ' <<<"${archive_manifest}" >/dev/null
+          candidate_config_path="$(jq -er '.[0].Config' <<<"${archive_manifest}")"
+          test "$(grep -Fxc "${candidate_config_path}" <<<"${archive_entries}")" = 1
+          candidate_config="${RUNNER_TEMP}/devpath-sandbox-svc-candidate-config.json"
+          tar -xOf "${CANDIDATE_ARCHIVE}" "${candidate_config_path}" \
+            >"${candidate_config}"
+          candidate_config_digest="sha256:$(sha256sum "${candidate_config}" | awk '{print $1}')"
+          test "${candidate_config_path}" = \
+            "blobs/sha256/${candidate_config_digest#sha256:}"
+          [[ "${candidate_config_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          jq -e \
+            --arg sha "${SOURCE_SHA}" \
+            --arg source "${EXPECTED_OCI_SOURCE}" '
+              .architecture == "amd64" and
+              .os == "linux" and
+              .rootfs.type == "layers" and
+              (.rootfs.diff_ids | type) == "array" and
+              (.rootfs.diff_ids | length) > 0 and
+              (.rootfs.diff_ids | unique | length) == (.rootfs.diff_ids | length) and
+              all(.rootfs.diff_ids[]; test("^sha256:[0-9a-f]{64}$")) and
+              .config.Labels["org.opencontainers.image.revision"] == $sha and
+              .config.Labels["org.opencontainers.image.source"] == $source
+            ' "${candidate_config}" >/dev/null
+          layer_count="$(jq -er '.[0].Layers | length' <<<"${archive_manifest}")"
+          rootfs_count="$(jq -er '.rootfs.diff_ids | length' "${candidate_config}")"
+          test "${layer_count}" = "${rootfs_count}"
+          candidate_rootfs_diff_ids="$(jq -c '.rootfs.diff_ids' "${candidate_config}")"
+          echo "config_digest=${candidate_config_digest}" >>"${GITHUB_OUTPUT}"
+          echo "rootfs_diff_ids=${candidate_rootfs_diff_ids}" >>"${GITHUB_OUTPUT}"
+      - name: Recheck immutable tag immediately before binding
+        id: tag-recheck
+        env:
+          IMAGE_REPOSITORY: ghcr.io/devpathai/devpath-sandbox-svc
+          IMAGE_TAG: ${{ github.sha }}
+          SOURCE_SHA: ${{ github.sha }}
+          EXPECTED_OCI_SOURCE: https://github.com/DevPathAi/devpath-sandbox-svc
+          REGISTRY_USERNAME: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+          EXPECTED_IMAGE_DIGEST: ${{ steps.immutable-tag.outputs.image_digest }}
+          EXPECTED_MANIFEST_DIGEST: ${{ steps.immutable-tag.outputs.manifest_digest }}
+          EXPECTED_CONFIG_DIGEST: ${{ steps.immutable-tag.outputs.config_digest }}
+          EXPECTED_ROOTFS_DIFF_IDS_JSON: ${{ steps.immutable-tag.outputs.rootfs_diff_ids }}
+        run: node .github/scripts/immutable-image-registry.mjs --allow-absent
+      - name: Bind immutable source tag once
+        id: bind-tag
+        env:
+          CANDIDATE_ARCHIVE: ${{ runner.temp }}/devpath-sandbox-svc-candidate.tar
+          TAG_REFERENCE: ghcr.io/devpathai/devpath-sandbox-svc:${{ github.sha }}
+          CANDIDATE_REFERENCE: devpath-sandbox-svc-candidate:${{ github.sha }}
+          PREFLIGHT_STATE: ${{ steps.immutable-tag.outputs.state }}
+          PREFLIGHT_IMAGE_DIGEST: ${{ steps.immutable-tag.outputs.image_digest }}
+          PREFLIGHT_MANIFEST_DIGEST: ${{ steps.immutable-tag.outputs.manifest_digest }}
+          PREFLIGHT_CONFIG_DIGEST: ${{ steps.immutable-tag.outputs.config_digest }}
+          PREFLIGHT_ROOTFS_DIFF_IDS: ${{ steps.immutable-tag.outputs.rootfs_diff_ids }}
+          RECHECK_STATE: ${{ steps.tag-recheck.outputs.state }}
+          RECHECK_IMAGE_DIGEST: ${{ steps.tag-recheck.outputs.image_digest }}
+          RECHECK_MANIFEST_DIGEST: ${{ steps.tag-recheck.outputs.manifest_digest }}
+          RECHECK_CONFIG_DIGEST: ${{ steps.tag-recheck.outputs.config_digest }}
+          RECHECK_ROOTFS_DIFF_IDS: ${{ steps.tag-recheck.outputs.rootfs_diff_ids }}
+          CANDIDATE_CONFIG_DIGEST: ${{ steps.candidate-identity.outputs.config_digest }}
+          CANDIDATE_ROOTFS_DIFF_IDS: ${{ steps.candidate-identity.outputs.rootfs_diff_ids }}
         run: |
-          git config user.name "devpath-gitops-bot[bot]"
-          git config user.email "devpath-gitops-bot[bot]@users.noreply.github.com"
-          git add -A
-          git diff --cached --quiet && echo "no change" && exit 0
-          git commit -m "deploy(devpath-sandbox-svc): ${{ github.sha }}"
-          for i in 1 2 3; do git push && break || (git pull --rebase && sleep 2); done
+          set -euo pipefail
+          case "${PREFLIGHT_STATE}" in
+            present)
+              test "${RECHECK_STATE}" = present
+              test "${RECHECK_IMAGE_DIGEST}" = "${PREFLIGHT_IMAGE_DIGEST}"
+              test "${RECHECK_MANIFEST_DIGEST}" = "${PREFLIGHT_MANIFEST_DIGEST}"
+              test "${RECHECK_CONFIG_DIGEST}" = "${PREFLIGHT_CONFIG_DIGEST}"
+              test "${RECHECK_ROOTFS_DIFF_IDS}" = "${PREFLIGHT_ROOTFS_DIFF_IDS}"
+              test "${RECHECK_CONFIG_DIGEST}" = "${CANDIDATE_CONFIG_DIGEST}"
+              test "${RECHECK_ROOTFS_DIFF_IDS}" = "${CANDIDATE_ROOTFS_DIFF_IDS}"
+              echo "mode=reused" >>"${GITHUB_OUTPUT}"
+              echo "expected_image_digest=${PREFLIGHT_IMAGE_DIGEST}" >>"${GITHUB_OUTPUT}"
+              echo "expected_manifest_digest=${PREFLIGHT_MANIFEST_DIGEST}" >>"${GITHUB_OUTPUT}"
+              echo "expected_config_digest=${PREFLIGHT_CONFIG_DIGEST}" >>"${GITHUB_OUTPUT}"
+              echo "expected_rootfs_diff_ids=${PREFLIGHT_ROOTFS_DIFF_IDS}" >>"${GITHUB_OUTPUT}"
+              ;;
+            absent)
+              test "${RECHECK_STATE}" = absent
+              [[ "${CANDIDATE_CONFIG_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
+              test -n "${CANDIDATE_ROOTFS_DIFF_IDS}"
+              docker load --input "${CANDIDATE_ARCHIVE}"
+              docker tag "${CANDIDATE_REFERENCE}" "${TAG_REFERENCE}"
+              docker push "${TAG_REFERENCE}"
+              echo "mode=created" >>"${GITHUB_OUTPUT}"
+              echo "expected_image_digest=" >>"${GITHUB_OUTPUT}"
+              echo "expected_manifest_digest=" >>"${GITHUB_OUTPUT}"
+              echo "expected_config_digest=${CANDIDATE_CONFIG_DIGEST}" >>"${GITHUB_OUTPUT}"
+              echo "expected_rootfs_diff_ids=${CANDIDATE_ROOTFS_DIFF_IDS}" >>"${GITHUB_OUTPUT}"
+              ;;
+            *)
+              echo "Invalid immutable tag preflight state" >&2
+              exit 1
+              ;;
+          esac
+      - name: Verify published digest and OCI identity
+        id: postflight
+        env:
+          IMAGE_REPOSITORY: ghcr.io/devpathai/devpath-sandbox-svc
+          IMAGE_TAG: ${{ github.sha }}
+          SOURCE_SHA: ${{ github.sha }}
+          EXPECTED_OCI_SOURCE: https://github.com/DevPathAi/devpath-sandbox-svc
+          REGISTRY_USERNAME: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+          EXPECTED_IMAGE_DIGEST: ${{ steps.bind-tag.outputs.expected_image_digest }}
+          EXPECTED_MANIFEST_DIGEST: ${{ steps.bind-tag.outputs.expected_manifest_digest }}
+          EXPECTED_CONFIG_DIGEST: ${{ steps.bind-tag.outputs.expected_config_digest }}
+          EXPECTED_ROOTFS_DIFF_IDS_JSON: ${{ steps.bind-tag.outputs.expected_rootfs_diff_ids }}
+        run: node .github/scripts/immutable-image-registry.mjs
+      - name: Hash exact producer workflow
+        id: producer
+        shell: bash
+        run: |
+          set -euo pipefail
+          git show "${{ github.sha }}:.github/workflows/ci.yml" \
+            >"${RUNNER_TEMP}/producer-workflow.yml"
+          cmp --silent .github/workflows/ci.yml \
+            "${RUNNER_TEMP}/producer-workflow.yml"
+          workflow_sha256="$(sha256sum "${RUNNER_TEMP}/producer-workflow.yml" | awk '{print $1}')"
+          [[ "${workflow_sha256}" =~ ^[0-9a-f]{64}$ ]]
+          echo "workflow_sha256=${workflow_sha256}" >>"${GITHUB_OUTPUT}"
+      - name: Reopen immutable digest and preserve sanitized evidence
+        id: stable-postflight
+        env:
+          IMAGE_REPOSITORY: ghcr.io/devpathai/devpath-sandbox-svc
+          IMAGE_TAG: ${{ github.sha }}
+          SOURCE_SHA: ${{ github.sha }}
+          EXPECTED_OCI_SOURCE: https://github.com/DevPathAi/devpath-sandbox-svc
+          REGISTRY_USERNAME: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+          EXPECTED_IMAGE_DIGEST: ${{ steps.postflight.outputs.image_digest }}
+          EXPECTED_MANIFEST_DIGEST: ${{ steps.postflight.outputs.manifest_digest }}
+          EXPECTED_CONFIG_DIGEST: ${{ steps.postflight.outputs.config_digest }}
+          EXPECTED_ROOTFS_DIFF_IDS_JSON: ${{ steps.postflight.outputs.rootfs_diff_ids }}
+          PRODUCER_REPOSITORY: DevPathAi/devpath-sandbox-svc
+          PRODUCER_WORKFLOW_PATH: .github/workflows/ci.yml
+          PRODUCER_WORKFLOW_SHA256: ${{ steps.producer.outputs.workflow_sha256 }}
+          PRODUCER_RUN_ID: ${{ github.run_id }}
+          PRODUCER_RUN_ATTEMPT: ${{ github.run_attempt }}
+          EVIDENCE_PATH: ${{ runner.temp }}/evidence.json
+        run: >-
+          node .github/scripts/immutable-image-registry.mjs --evidence "${EVIDENCE_PATH}"
+      - name: Upload sanitized immutable image evidence
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: devpath-sandbox-svc-immutable-image-${{ github.sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/evidence.json
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 30

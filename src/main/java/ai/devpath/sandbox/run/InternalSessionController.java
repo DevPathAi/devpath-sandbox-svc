@@ -39,4 +39,13 @@ public class InternalSessionController {
         .map(SandboxSessionView::from)
         .toList();
   }
+
+  /** Mentor context 전용 최근 실행 metadata. raw code/output은 서비스 경계를 넘지 않는다. */
+  @GetMapping("/recent/metadata")
+  public List<SandboxSessionMetadata> recentMetadata(
+      @RequestParam long userId,
+      @RequestParam(defaultValue = "5") int limit) {
+    int clamped = Math.min(Math.max(limit, 1), MAX_LIMIT);
+    return sessions.findRecentMetadataByUserId(userId, PageRequest.of(0, clamped));
+  }
 }

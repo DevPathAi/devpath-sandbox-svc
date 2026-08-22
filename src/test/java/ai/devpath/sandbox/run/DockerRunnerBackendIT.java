@@ -68,7 +68,7 @@ class DockerRunnerBackendIT {
   }
 
   @Test
-  void returnsMinusOneWhenExecutionTimesOut() {
+  void returnsExplicitTimedOutStatusWhenExecutionTimesOut() {
     List<String> logs = new ArrayList<>();
 
     RunResult result = backend.run(
@@ -76,6 +76,7 @@ class DockerRunnerBackendIT {
         logs::add);
 
     assertEquals(-1, result.exitCode());
+    assertEquals(SandboxTerminalStatus.TIMED_OUT, result.terminalStatus());
     assertTrue(result.stderr().contains("Execution timed out after 30s"));
     assertTrue(logs.stream().anyMatch(line -> line.contains("Execution timed out after 30s")));
   }

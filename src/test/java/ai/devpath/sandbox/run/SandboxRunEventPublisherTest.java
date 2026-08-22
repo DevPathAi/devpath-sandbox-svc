@@ -32,4 +32,18 @@ class SandboxRunEventPublisherTest {
     assertThat(entry.getPayload()).contains("\"language\": \"PYTHON\"");
     assertThat(entry.getPayload()).contains("\"contentId\": 77");
   }
+
+  @Test
+  void retryUsesOneDeterministicOutboxRow() {
+    publisher.publishSubmitted(124L, 43L, "JAVA", null);
+    publisher.publishSubmitted(124L, 43L, "JAVA", null);
+
+    var entries = outbox.findTop100ByPublishedAtIsNullOrderByCreatedAtAsc().stream()
+        .filter(e -> "124".equals(e.getAggregateId()))
+        .toList();
+
+    assertThat(entries).hasSize(1);
+    assertThat(entries.getFirst().getDedupeKey())
+        .isEqualTo("sandbox.run.submitted:124");
+  }
 }

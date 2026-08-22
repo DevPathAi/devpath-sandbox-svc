@@ -1,17 +1,62 @@
 devpath:
   auth:
     jwt-secret: ${JWT_SECRET:test-secret-please-change-min-32-bytes-long-0123456789}
+    internal-token: ${INTERNAL_API_TOKEN:}
   sandbox:
+    pod-name: ${HOSTNAME:local-sandbox}
+    lease:
+      duration-ms: ${SANDBOX_LEASE_DURATION_MS:20000}
+      heartbeat-ms: ${SANDBOX_LEASE_HEARTBEAT_MS:5000}
+    terminal-persistence-attempts: ${SANDBOX_TERMINAL_PERSISTENCE_ATTEMPTS:3}
+    terminal-retry-budget-ms: ${SANDBOX_TERMINAL_RETRY_BUDGET_MS:4000}
+    terminal-retry-batch-size: ${SANDBOX_TERMINAL_RETRY_BATCH_SIZE:2}
+    terminal-backlog:
+      max-entries: ${SANDBOX_TERMINAL_BACKLOG_MAX_ENTRIES:8}
+      max-bytes: ${SANDBOX_TERMINAL_BACKLOG_MAX_BYTES:2105344}
+    runner:
+      endpoint: ${DOCKER_HOST:}
+      runtime: ${SANDBOX_RUNTIME:}
+      require-isolation: ${SANDBOX_REQUIRE_ISOLATION:false}
+      tls-verify: ${SANDBOX_RUNNER_TLS_VERIFY:false}
+      cert-path: ${DOCKER_CERT_PATH:}
+      health-initial-delay-ms: ${SANDBOX_RUNNER_HEALTH_INITIAL_DELAY_MS:0}
+      health-delay-ms: ${SANDBOX_RUNNER_HEALTH_DELAY_MS:5000}
+      reaper-initial-delay-ms: ${SANDBOX_REAPER_INITIAL_DELAY_MS:10000}
+      reaper-delay-ms: ${SANDBOX_REAPER_DELAY_MS:10000}
     sse-timeout-ms: 60000
+    sse-heartbeat-ms: 10000
+    executor:
+      parallelism: ${SANDBOX_PARALLELISM:4}
+      queue-capacity: ${SANDBOX_QUEUE_CAPACITY:4}
+      active-cutoff-ms: ${SANDBOX_ACTIVE_CUTOFF_MS:60000}
+      drain-timeout-ms: ${SANDBOX_DRAIN_TIMEOUT_MS:75000}
+    reconcile:
+      stale-after-ms: ${SANDBOX_STALE_AFTER_MS:35000}
+      correction-grace-ms: ${SANDBOX_RECONCILIATION_CORRECTION_GRACE_MS:30000}
+      publish-grace-ms: ${SANDBOX_RECONCILIATION_PUBLISH_GRACE_MS:30000}
+      initial-delay-ms: ${SANDBOX_RECONCILE_INITIAL_DELAY_MS:5000}
+      fixed-delay-ms: ${SANDBOX_RECONCILE_DELAY_MS:5000}
+      batch-size: ${SANDBOX_RECONCILE_BATCH_SIZE:100}
 
 spring:
   application:
     name: devpath-sandbox-svc
+  lifecycle:
+    timeout-per-shutdown-phase: 90s
   datasource:
     url: ${DB_URL:jdbc:postgresql://localhost:5432/devpath}
     username: ${DB_USER:devpath}
     password: ${DB_PASSWORD:localdev}
     driver-class-name: org.postgresql.Driver
+    hikari:
+      connection-timeout: 4000
+      validation-timeout: 2000
+      data-source-properties:
+        connectTimeout: 4
+        socketTimeout: 4
+        tcpKeepAlive: true
+  transaction:
+    default-timeout: 4s
   jpa:
     hibernate:
       ddl-auto: validate
@@ -30,9 +75,15 @@ spring:
 
 server:
   port: 8080
+  shutdown: graceful
 
 management:
   endpoints:
     web:
       exposure:
         include: health, info, metrics
+  endpoint:
+    health:
+      group:
+        readiness:
+          include: readinessState,sandboxRunner

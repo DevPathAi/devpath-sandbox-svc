@@ -1,14 +1,17 @@
 package ai.devpath.sandbox.run;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.when;
 
 import ai.devpath.sandbox.outbox.OutboxRepository;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
-import java.util.function.Consumer;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -20,97 +23,110 @@ import org.springframework.test.context.bean.override.mockito.MockitoBean;
 class SandboxRunServiceTest {
 
   @Autowired SandboxRunService service;
-  @Autowired OutboxRepository outboxRepo;
+  @Autowired SandboxSessionRepository sessions;
+  @Autowired OutboxRepository outbox;
   @MockitoBean RunnerBackend runnerBackend;
 
+  @BeforeEach
+  void cleanup() {
+    outbox.deleteAll();
+    sessions.deleteAll();
+  }
+
   @Test
-  void successfulRunCompletesSessionAndPublishesEvent() {
-    when(runnerBackend.run(any(), any()))
+  void successfulRunCompletesSessionAndPublishesEvent() throws Exception {
+    when(runnerBackend.run(any(), any(), any()))
         .thenReturn(new RunResult(0, "ok\n", "", 120L, 24));
+    RecordingDelivery delivery = new RecordingDelivery();
 
-    SandboxSession session = service.execute(
-        42L, new SandboxRunRequest("print(1)", "PYTHON", 10L, 20L), line -> {});
+    AcceptedSandboxRun accepted = service.start(
+        42L, new SandboxRunRequest("print(1)", "PYTHON", 10L, 20L), delivery);
+    SandboxSession session = awaitTerminal(accepted.sessionId(), delivery);
 
-    assertNotNull(session.getId());
-    assertEquals("COMPLETED", session.getStatus());
-    assertEquals(0, session.getExitCode());
-    assertEquals("ok\n", session.getStdout());
-    assertEquals(42L, session.getUserId());
-    assertEquals(10L, session.getContentId());
-    assertEquals(20L, session.getCodeBlockId());
+    assertThat(session.getStatus()).isEqualTo("COMPLETED");
+    assertThat(session.getExitCode()).isZero();
+    assertThat(session.getStdout()).isEqualTo("ok\n");
+    assertThat(session.getUserId()).isEqualTo(42L);
+    assertThat(session.getContentId()).isEqualTo(10L);
+    assertThat(session.getCodeBlockId()).isEqualTo(20L);
+    assertThat(outbox.count()).isEqualTo(1L);
   }
 
   @Test
-  void nonZeroExitCodeMarksFailed() {
-    when(runnerBackend.run(any(), any()))
-        .thenReturn(new RunResult(1, "", "boom\n", 50L, 12));
+  void explicitTimedOutResultIsNotCollapsedIntoKilled() throws Exception {
+    when(runnerBackend.run(any(), any(), any()))
+        .thenReturn(RunResult.timedOut("partial", "Execution timed out"));
+    RecordingDelivery delivery = new RecordingDelivery();
 
-    SandboxSession session = service.execute(
-        2L, new SandboxRunRequest("raise", "PYTHON", null, null), line -> {});
+    AcceptedSandboxRun accepted = service.start(
+        43L, new SandboxRunRequest("loop", "PYTHON", null, null), delivery);
 
-    assertEquals("FAILED", session.getStatus());
-    assertEquals(1, session.getExitCode());
-    assertEquals("boom\n", session.getStderr());
+    assertThat(awaitTerminal(accepted.sessionId(), delivery).getStatus()).isEqualTo("TIMED_OUT");
   }
 
   @Test
-  void minusOneExitCodeMarksKilled() {
-    when(runnerBackend.run(any(), any()))
-        .thenReturn(new RunResult(-1, "", "실행 시간 초과(30s)\n", null, null));
+  void backendFailureStillLeavesADurableFailedTerminal() throws Exception {
+    when(runnerBackend.run(any(), any(), any()))
+        .thenThrow(new SandboxUnavailableException("Docker unavailable"));
+    RecordingDelivery delivery = new RecordingDelivery();
 
-    SandboxSession session = service.execute(
-        3L, new SandboxRunRequest("while True: pass", "PYTHON", null, null), line -> {});
+    AcceptedSandboxRun accepted = service.start(
+        44L, new SandboxRunRequest("print(1)", "PYTHON", null, null), delivery);
 
-    assertEquals("KILLED", session.getStatus());
+    SandboxSession session = awaitTerminal(accepted.sessionId(), delivery);
+    assertThat(session.getStatus()).isEqualTo("FAILED");
+    assertThat(outbox.count()).isEqualTo(1L);
   }
 
   @Test
-  void unavailableBackendThrowsSandboxUnavailableException() {
-    when(runnerBackend.run(any(), any()))
-        .thenThrow(new SandboxUnavailableException("Docker 미가동"));
+  void nullBackendResultIsPersistedAsFailedInsteadOfLeavingRunningForever() throws Exception {
+    when(runnerBackend.run(any(), any(), any())).thenReturn(null);
+    RecordingDelivery delivery = new RecordingDelivery();
 
-    assertThrows(SandboxUnavailableException.class, () ->
-        service.execute(4L, new SandboxRunRequest("print(1)", "PYTHON", null, null), line -> {}));
+    AcceptedSandboxRun accepted = service.start(
+        46L, new SandboxRunRequest("print(1)", "PYTHON", null, null), delivery);
+
+    assertThat(awaitTerminal(accepted.sessionId(), delivery).getStatus()).isEqualTo("FAILED");
   }
 
   @Test
-  void outboxEntryIsCreatedForEachRun() {
-    when(runnerBackend.run(any(), any()))
-        .thenReturn(new RunResult(0, "ok\n", "", 60L, 10));
+  void logCallbackIsBestEffortAndTerminalPersistenceIsIndependent() throws Exception {
+    when(runnerBackend.run(any(), any(), any())).thenAnswer(inv -> {
+      java.util.function.Consumer<String> callback = inv.getArgument(1);
+      callback.accept("line-A");
+      callback.accept("line-B");
+      return new RunResult(0, "line-A\nline-B\n", "", null, null);
+    });
+    RecordingDelivery delivery = new RecordingDelivery();
 
-    long countBefore = outboxRepo.count();
-    service.execute(6L, new SandboxRunRequest("x=1", "PYTHON", null, null), line -> {});
-    long countAfter = outboxRepo.count();
+    AcceptedSandboxRun accepted = service.start(
+        45L, new SandboxRunRequest("x=1", "PYTHON", null, null), delivery);
 
-    assertEquals(countBefore + 1, countAfter, "outbox에 1건 추가");
+    assertThat(awaitTerminal(accepted.sessionId(), delivery).getStatus()).isEqualTo("COMPLETED");
+    assertThat(delivery.logs).containsExactly("line-A", "line-B");
   }
 
-  @Test
-  void logCallbackIsInvokedForEachLogLine() {
-    when(runnerBackend.run(any(), any()))
-        .thenAnswer(inv -> {
-          Consumer<String> cb = inv.getArgument(1);
-          cb.accept("log-line-A");
-          cb.accept("log-line-B");
-          return new RunResult(0, "log-line-A\nlog-line-B\n", "", null, null);
-        });
-
-    var received = new java.util.ArrayList<String>();
-    service.execute(7L, new SandboxRunRequest("x=1", "PYTHON", null, null), received::add);
-
-    assertEquals(List.of("log-line-A", "log-line-B"), received);
+  private SandboxSession awaitTerminal(long sessionId, RecordingDelivery delivery) throws Exception {
+    assertThat(delivery.completed.await(2, TimeUnit.SECONDS)).isTrue();
+    Instant deadline = Instant.now().plus(Duration.ofSeconds(2));
+    while (Instant.now().isBefore(deadline)) {
+      SandboxSession session = sessions.findById(sessionId).orElseThrow();
+      if (List.of("COMPLETED", "FAILED", "KILLED", "TIMED_OUT")
+          .contains(session.getStatus())) {
+        return session;
+      }
+      Thread.sleep(10L);
+    }
+    throw new AssertionError("terminal session was not persisted");
   }
 
-  @Test
-  void backendFailureDoesNotPublishEvent() {
-    when(runnerBackend.run(any(), any()))
-        .thenThrow(new SandboxUnavailableException("Docker 미가동"));
+  private static final class RecordingDelivery implements SandboxRunDelivery {
+    private final List<String> logs = new ArrayList<>();
+    private final CountDownLatch completed = new CountDownLatch(1);
 
-    long before = outboxRepo.count();
-    assertThrows(SandboxUnavailableException.class, () ->
-        service.execute(8L, new SandboxRunRequest("print(1)", "PYTHON", null, null), line -> {}));
-
-    assertEquals(before, outboxRepo.count(),
-        "실행이 완료되지 못하면(run throw) 리뷰 이벤트를 발행하지 않는다(발행은 finish에서)");
+    @Override public void session(long sessionId) {}
+    @Override public void log(String line) { logs.add(line); }
+    @Override public void result(SandboxTerminalEvent event) {}
+    @Override public void complete() { completed.countDown(); }
   }
 }

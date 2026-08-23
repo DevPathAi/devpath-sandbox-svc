@@ -44,7 +44,7 @@ class DockerRunnerHardeningTest {
   }
 
   @Test
-  void hardenedHostConfigUsesRunscNanoCpuAndNoNetwork() {
+  void hardenedHostConfigUsesRunscNanoCpuNprocLimitAndNoNetwork() {
     SandboxRunnerProperties properties =
         new SandboxRunnerProperties("tcp://runner:2376", "runsc", true, true, "/certs");
 
@@ -55,13 +55,36 @@ class DockerRunnerHardeningTest {
     assertThat(config.getNanoCPUs()).isEqualTo(1_000_000_000L);
     assertThat(config.getNetworkMode()).isEqualTo("none");
     assertThat(config.getMemory()).isEqualTo(512L * 1024 * 1024);
-    assertThat(config.getPidsLimit()).isEqualTo(128L);
+    assertThat(config.getPidsLimit()).isNull();
+    assertThat(config.getUlimits()).singleElement().satisfies(limit -> {
+      assertThat(limit.getName()).isEqualTo("nproc");
+      assertThat(limit.getSoftLong()).isEqualTo(128L);
+      assertThat(limit.getHardLong()).isEqualTo(128L);
+    });
     assertThat(config.getReadonlyRootfs()).isTrue();
     assertThat(config.getSecurityOpts()).contains("no-new-privileges:true");
     assertThat(config.getBinds()).hasSize(1);
     assertThat(config.getBinds()[0].getPath()).isEqualTo("devpath-sandbox-91-source");
     assertThat(config.getBinds()[0].getAccessMode()).isEqualTo(com.github.dockerjava.api.model.AccessMode.ro);
     assertThat(config.getTmpFs()).containsKey("/tmp");
+  }
+
+  @Test
+  void sourceLoaderUsesTheSmallerRunscCompatibleNprocLimit() {
+    SandboxRunnerProperties properties =
+        new SandboxRunnerProperties("tcp://runner:2376", "runsc", true, true, "/certs");
+
+    var config = DockerRunnerBackend.sourceLoaderHostConfig(
+        "devpath-sandbox-91-source", properties);
+
+    assertThat(config.getPidsLimit()).isNull();
+    assertThat(config.getUlimits()).singleElement().satisfies(limit -> {
+      assertThat(limit.getName()).isEqualTo("nproc");
+      assertThat(limit.getSoftLong()).isEqualTo(16L);
+      assertThat(limit.getHardLong()).isEqualTo(16L);
+    });
+    assertThat(config.getRuntime()).isEqualTo("runsc");
+    assertThat(config.getNetworkMode()).isEqualTo("none");
   }
 
   @Test

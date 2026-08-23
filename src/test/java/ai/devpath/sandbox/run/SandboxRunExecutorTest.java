@@ -62,11 +62,26 @@ class SandboxRunExecutorTest {
   @Test
   void releasesUserAdmissionAfterWorkFinishes() throws Exception {
     executor = new SandboxRunExecutor(1, 0, 2_000, new SimpleMeterRegistry());
-    CountDownLatch finished = new CountDownLatch(1);
+    CountDownLatch started = new CountDownLatch(1);
+    CountDownLatch allowReturn = new CountDownLatch(1);
 
-    executor.submit(77L, () -> finished::countDown);
-    assertThat(finished.await(1, TimeUnit.SECONDS)).isTrue();
+    executor.submit(77L, () -> () -> {
+      started.countDown();
+      try {
+        allowReturn.await();
+      } catch (InterruptedException interrupted) {
+        Thread.currentThread().interrupt();
+      }
+    });
+    try {
+      assertThat(started.await(1, TimeUnit.SECONDS)).isTrue();
+      assertThrows(SandboxBusyException.class,
+          () -> executor.submit(77L, () -> () -> {}));
+    } finally {
+      allowReturn.countDown();
+    }
 
+    awaitAdmissionRelease(77L);
     CountDownLatch replayFinished = new CountDownLatch(1);
     executor.submit(77L, () -> replayFinished::countDown);
     assertThat(replayFinished.await(1, TimeUnit.SECONDS)).isTrue();
@@ -155,5 +170,18 @@ class SandboxRunExecutorTest {
         Thread.currentThread().interrupt();
       }
     };
+  }
+
+  private void awaitAdmissionRelease(long userId) throws InterruptedException {
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
+    while (System.nanoTime() < deadline) {
+      try {
+        executor.assertCanAdmit(userId);
+        return;
+      } catch (SandboxBusyException ignored) {
+        Thread.sleep(1L);
+      }
+    }
+    executor.assertCanAdmit(userId);
   }
 }

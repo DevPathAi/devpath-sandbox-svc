@@ -25,14 +25,17 @@ public class RunController {
 
   private final SandboxRunService runService;
   private final SandboxHeartbeatScheduler heartbeatScheduler;
+  private final SandboxReleaseFaultRegistry releaseFaults;
   private final long sseTimeoutMs;
 
   public RunController(
       SandboxRunService runService,
       SandboxHeartbeatScheduler heartbeatScheduler,
+      SandboxReleaseFaultRegistry releaseFaults,
       @Value("${devpath.sandbox.sse-timeout-ms:60000}") long sseTimeoutMs) {
     this.runService = runService;
     this.heartbeatScheduler = heartbeatScheduler;
+    this.releaseFaults = releaseFaults;
     this.sseTimeoutMs = sseTimeoutMs;
   }
 
@@ -40,7 +43,9 @@ public class RunController {
   public ResponseEntity<SseEmitter> run(
       @AuthenticationPrincipal Jwt jwt,
       @RequestBody SandboxRunRequest request,
-      @RequestHeader(name = EVENT_VERSION_HEADER, required = false) String eventVersion) {
+      @RequestHeader(name = EVENT_VERSION_HEADER, required = false) String eventVersion,
+      @RequestHeader(name = "X-Candidate-Spec-Sha256", required = false) String candidate,
+      @RequestHeader(name = "X-Release-Run-Key", required = false) String releaseRunKey) {
     validate(request);
     long userId = Long.parseLong(jwt.getSubject());
     runService.assertCanAdmit(userId);
@@ -54,7 +59,11 @@ public class RunController {
         new SseSandboxRunDelivery(emitter, terminalEventsEnabled));
     AcceptedSandboxRun accepted;
     try {
-      accepted = runService.start(userId, request, delivery);
+      accepted = runService.start(
+          userId,
+          request,
+          delivery,
+          releaseFaults.consumeForRun(candidate, releaseRunKey));
     } catch (RuntimeException admissionFailure) {
       delivery.complete();
       throw admissionFailure;

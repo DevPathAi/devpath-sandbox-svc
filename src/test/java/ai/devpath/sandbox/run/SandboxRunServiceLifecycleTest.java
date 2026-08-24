@@ -180,6 +180,57 @@ class SandboxRunServiceLifecycleTest {
             && result.outputTruncated()));
   }
 
+  @Test
+  void releaseFaultPlanChangesDeliveryAndTerminalResultWithoutSkippingRealRunner()
+      throws Exception {
+    SandboxRunPersistenceService persistence = mock(SandboxRunPersistenceService.class);
+    RunnerBackend backend = mock(RunnerBackend.class);
+    SimpleMeterRegistry metrics = new SimpleMeterRegistry();
+    executor = new SandboxRunExecutor(1, 0, 2_000, metrics);
+    SandboxTerminalFinalizer finalizer = new SandboxTerminalFinalizer(persistence, metrics, 1);
+    SandboxRunService service = new SandboxRunService(persistence, backend, executor, finalizer);
+    SandboxSession allocated = mock(SandboxSession.class);
+    SandboxSession terminal = mock(SandboxSession.class);
+    when(allocated.getId()).thenReturn(401L);
+    when(persistence.allocate(anyLong(), any())).thenReturn(allocated);
+    when(persistence.markRunning(401L)).thenReturn(true);
+    when(backend.run(any(), any(), any())).thenReturn(
+        new RunResult(0, "real-runtime-output", "", 2L, 3));
+    when(persistence.finish(eq(401L), any())).thenReturn(terminal);
+    when(terminal.getId()).thenReturn(401L);
+    when(terminal.getStatus()).thenReturn("TIMED_OUT");
+    when(terminal.getExitCode()).thenReturn(-1);
+
+    SandboxReleaseFaultRegistry registry = new SandboxReleaseFaultRegistry(true);
+    String candidate = "a".repeat(64);
+    String runKey = "R".repeat(43);
+    registry.arm(candidate, runKey, "next-run-immediate-disconnect");
+    registry.arm(candidate, runKey, "next-run-timeout");
+    CountDownLatch completed = new CountDownLatch(1);
+    SandboxRunDelivery delivery = new SandboxRunDelivery() {
+      @Override public void session(long sessionId) {}
+      @Override public void log(String line) {}
+      @Override public void result(SandboxTerminalEvent event) {}
+      @Override public void complete() { completed.countDown(); }
+    };
+
+    service.start(
+        4L,
+        new SandboxRunRequest("print(1)", "PYTHON", null, null),
+        delivery,
+        registry.consumeForRun(candidate, runKey));
+
+    assertThat(completed.await(1, TimeUnit.SECONDS)).isTrue();
+    verify(backend, org.mockito.Mockito.timeout(1_000)).run(any(), any(), any());
+    verify(persistence, org.mockito.Mockito.timeout(1_000)).finish(
+        eq(401L),
+        org.mockito.ArgumentMatchers.argThat(result ->
+            result.terminalStatus() == SandboxTerminalStatus.TIMED_OUT
+                && result.stdout().equals("real-runtime-output")));
+    assertThat(registry.checkpoint(
+        candidate, runKey, "immediate-disconnect-timed-out")).isTrue();
+  }
+
   private static SandboxRunDelivery noOpDelivery() {
     return new SandboxRunDelivery() {
       @Override public void session(long sessionId) {}

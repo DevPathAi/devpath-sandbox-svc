@@ -28,6 +28,7 @@ class RunControllerV2ContractTest {
 
   @Autowired MockMvc mvc;
   @MockitoBean SandboxRunService runService;
+  @MockitoBean SandboxReleaseFaultRegistry releaseFaults;
 
   @Test
   void acceptedRunExposesHeaderAndEarlyNumericSessionThenV2TerminalResult() throws Exception {
@@ -39,7 +40,7 @@ class RunControllerV2ContractTest {
       delivery.result(new SandboxTerminalEvent(99L, "TIMED_OUT", -1, true));
       delivery.complete();
       return new AcceptedSandboxRun(99L);
-    }).when(runService).start(anyLong(), any(), any());
+    }).when(runService).start(anyLong(), any(), any(), any());
 
     long startedAt = System.nanoTime();
     var result = mvc.perform(post("/sandbox/run")
@@ -73,7 +74,7 @@ class RunControllerV2ContractTest {
       delivery.result(new SandboxTerminalEvent(100L, "COMPLETED", 0, false));
       delivery.complete();
       return new AcceptedSandboxRun(100L);
-    }).when(runService).start(anyLong(), any(), any());
+    }).when(runService).start(anyLong(), any(), any(), any());
 
     var result = mvc.perform(post("/sandbox/run")
             .with(jwt().jwt(j -> j.subject("42")))

@@ -8,6 +8,7 @@ import com.github.dockerjava.api.model.Bind;
 import com.github.dockerjava.api.model.Capability;
 import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.HostConfig;
+import com.github.dockerjava.api.model.Ulimit;
 import com.github.dockerjava.api.model.Volume;
 import com.github.dockerjava.core.DefaultDockerClientConfig;
 import com.github.dockerjava.core.DockerClientConfig;
@@ -49,7 +50,8 @@ public class DockerRunnerBackend implements RunnerBackend {
   private static final int VOLUME_ORPHAN_DEADLINE_SECONDS = 8 * 60;
   private static final long MEMORY_BYTES = 512L * 1024 * 1024;
   private static final long NANO_CPUS = 1_000_000_000L;
-  private static final long PIDS_LIMIT = 128L;
+  private static final long PROCESS_LIMIT = 128L;
+  private static final long LOADER_PROCESS_LIMIT = 16L;
   static final String MANAGED_LABEL = "ai.devpath.sandbox.managed";
   static final String SESSION_LABEL = "ai.devpath.sandbox.session-id";
   static final String DEADLINE_LABEL = "ai.devpath.sandbox.deadline";
@@ -332,7 +334,11 @@ public class DockerRunnerBackend implements RunnerBackend {
         .withNetworkMode("none")
         .withMemory(MEMORY_BYTES)
         .withNanoCPUs(NANO_CPUS)
-        .withPidsLimit(PIDS_LIMIT)
+        // A Docker cgroup pids limit makes runsc fail during sandbox creation when
+        // the Docker daemon itself runs in the dedicated DinD pod. RLIMIT_NPROC is
+        // enforced by gVisor's application kernel and preserves the process/thread
+        // ceiling without asking nested runsc to create another pids cgroup.
+        .withUlimits(List.of(new Ulimit("nproc", PROCESS_LIMIT, PROCESS_LIMIT)))
         .withReadonlyRootfs(true)
         .withCapDrop(Capability.ALL)
         .withSecurityOpts(List.of("no-new-privileges:true"))
@@ -341,13 +347,14 @@ public class DockerRunnerBackend implements RunnerBackend {
         .withRuntime(properties.runtime().isBlank() ? null : properties.runtime());
   }
 
-  private static HostConfig sourceLoaderHostConfig(
+  static HostConfig sourceLoaderHostConfig(
       String sourceVolume, SandboxRunnerProperties properties) {
     return HostConfig.newHostConfig()
         .withNetworkMode("none")
         .withMemory(64L * 1024 * 1024)
         .withNanoCPUs(NANO_CPUS)
-        .withPidsLimit(16L)
+        .withUlimits(List.of(new Ulimit(
+            "nproc", LOADER_PROCESS_LIMIT, LOADER_PROCESS_LIMIT)))
         .withCapDrop(Capability.ALL)
         .withSecurityOpts(List.of("no-new-privileges:true"))
         .withBinds(new Bind(sourceVolume, new Volume("/workspace"), AccessMode.rw))

@@ -4,6 +4,7 @@ import static org.mockito.Mockito.when;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.jwt;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.request;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 import ai.devpath.sandbox.config.SecurityConfig;
@@ -27,6 +28,7 @@ class RunControllerEnvelopeTest {
 
   @Autowired MockMvc mvc;
   @MockitoBean SandboxRunService runService;
+  @MockitoBean SandboxReleaseFaultRegistry releaseFaults;
 
   private static RequestPostProcessor user(String sub) {
     return jwt().jwt(j -> j.subject(sub));
@@ -57,7 +59,8 @@ class RunControllerEnvelopeTest {
   void boundedAdmissionReturnsSandboxBusy429BeforeStreaming() throws Exception {
     when(runService.isRunnerAvailable()).thenReturn(true);
     when(runService.start(org.mockito.ArgumentMatchers.anyLong(),
-        org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
+        org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(),
+        org.mockito.ArgumentMatchers.any()))
         .thenThrow(new SandboxBusyException("Sandbox capacity is full"));
 
     mvc.perform(post("/sandbox/run").with(user("42"))
@@ -65,5 +68,28 @@ class RunControllerEnvelopeTest {
             .content("{\"code\":\"print(1)\",\"language\":\"PYTHON\"}"))
         .andExpect(status().isTooManyRequests())
         .andExpect(jsonPath("$.error.code").value("SANDBOX_BUSY"));
+  }
+
+  @Test
+  void browserRunHeadersAreBoundToTheSelectedReleasePlan() throws Exception {
+    when(runService.isRunnerAvailable()).thenReturn(true);
+    SandboxReleaseFaultPlan plan = org.mockito.Mockito.mock(SandboxReleaseFaultPlan.class);
+    when(releaseFaults.consumeForRun("a".repeat(64), "R".repeat(43))).thenReturn(plan);
+    when(runService.start(
+        org.mockito.ArgumentMatchers.eq(42L),
+        org.mockito.ArgumentMatchers.any(),
+        org.mockito.ArgumentMatchers.any(),
+        org.mockito.ArgumentMatchers.same(plan)))
+        .thenReturn(new AcceptedSandboxRun(73L));
+
+    mvc.perform(post("/sandbox/run").with(user("42"))
+            .header("X-Candidate-Spec-Sha256", "a".repeat(64))
+            .header("X-Release-Run-Key", "R".repeat(43))
+            .contentType(MediaType.APPLICATION_JSON)
+            .content("{\"code\":\"print(1)\",\"language\":\"PYTHON\"}"))
+        .andExpect(request().asyncStarted());
+
+    org.mockito.Mockito.verify(releaseFaults)
+        .consumeForRun("a".repeat(64), "R".repeat(43));
   }
 }

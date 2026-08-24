@@ -54,6 +54,15 @@ public class SandboxRunService {
       long userId,
       SandboxRunRequest request,
       SandboxRunDelivery delivery) {
+    return start(userId, request, delivery, SandboxReleaseFaultPlan.NONE);
+  }
+
+  public AcceptedSandboxRun start(
+      long userId,
+      SandboxRunRequest request,
+      SandboxRunDelivery delivery,
+      SandboxReleaseFaultPlan releaseFaults) {
+    SandboxRunDelivery plannedDelivery = releaseFaults.wrap(delivery);
     AtomicReference<AcceptedSandboxRun> accepted = new AtomicReference<>();
     executor.submit(userId, () -> {
       SandboxTerminalFinalizer.Reservation reservation = terminalFinalizer.reserve();
@@ -61,8 +70,9 @@ public class SandboxRunService {
         SandboxSession session = persistence.allocate(userId, request);
         long sessionId = session.getId();
         accepted.set(new AcceptedSandboxRun(sessionId));
-        deliver(() -> delivery.session(sessionId));
-        return new AcceptedRunWork(sessionId, request, delivery, reservation);
+        deliver(() -> plannedDelivery.session(sessionId));
+        return new AcceptedRunWork(
+            sessionId, request, plannedDelivery, reservation, releaseFaults);
       } catch (RuntimeException | Error failure) {
         reservation.close();
         throw failure;
@@ -75,7 +85,8 @@ public class SandboxRunService {
       long sessionId,
       SandboxRunRequest request,
       SandboxRunDelivery delivery,
-      SandboxTerminalFinalizer.Reservation reservation) {
+      SandboxTerminalFinalizer.Reservation reservation,
+      SandboxReleaseFaultPlan releaseFaults) {
     try {
       if (!persistence.markRunning(sessionId)) {
         reservation.close();
@@ -87,7 +98,8 @@ public class SandboxRunService {
           sessionId,
           killedResult(),
           delivery,
-          reservation);
+          reservation,
+          releaseFaults);
       return;
     }
 
@@ -114,19 +126,22 @@ public class SandboxRunService {
       result = new RunResult(status, exitCode, "", "", null, null, false);
     }
 
-    finalizeResult(sessionId, result, delivery, reservation);
+    finalizeResult(sessionId, releaseFaults.apply(result), delivery, reservation, releaseFaults);
   }
 
   private void finalizeResult(
       long sessionId,
       RunResult result,
       SandboxRunDelivery delivery,
-      SandboxTerminalFinalizer.Reservation reservation) {
+      SandboxTerminalFinalizer.Reservation reservation,
+      SandboxReleaseFaultPlan releaseFaults) {
     try {
       SandboxSession terminal = terminalFinalizer.finish(
           sessionId, SandboxOutputLimits.limit(result), reservation);
       executor.recordTerminal(terminal);
-      deliver(() -> delivery.result(SandboxTerminalEvent.from(terminal)));
+      SandboxTerminalEvent terminalEvent = SandboxTerminalEvent.from(terminal);
+      releaseFaults.recordTerminal(terminalEvent);
+      deliver(() -> delivery.result(terminalEvent));
     } catch (RuntimeException persistenceFailure) {
       // SandboxTerminalFinalizer retains the exact RunResult for background retry.
     } finally {
@@ -152,6 +167,7 @@ public class SandboxRunService {
     private final SandboxRunRequest request;
     private final SandboxRunDelivery delivery;
     private final SandboxTerminalFinalizer.Reservation reservation;
+    private final SandboxReleaseFaultPlan releaseFaults;
     private final java.util.concurrent.atomic.AtomicBoolean claimed =
         new java.util.concurrent.atomic.AtomicBoolean();
 
@@ -159,24 +175,27 @@ public class SandboxRunService {
         long sessionId,
         SandboxRunRequest request,
         SandboxRunDelivery delivery,
-        SandboxTerminalFinalizer.Reservation reservation) {
+        SandboxTerminalFinalizer.Reservation reservation,
+        SandboxReleaseFaultPlan releaseFaults) {
       this.sessionId = sessionId;
       this.request = request;
       this.delivery = delivery;
       this.reservation = reservation;
+      this.releaseFaults = releaseFaults;
     }
 
     @Override
     public void run() {
       if (claimed.compareAndSet(false, true)) {
-        executeAccepted(sessionId, request, delivery, reservation);
+        executeAccepted(sessionId, request, delivery, reservation, releaseFaults);
       }
     }
 
     @Override
     public void cancelBeforeStart() {
       if (claimed.compareAndSet(false, true)) {
-        finalizeResult(sessionId, killedResult(), delivery, reservation);
+        finalizeResult(
+            sessionId, killedResult(), delivery, reservation, releaseFaults);
       }
     }
 

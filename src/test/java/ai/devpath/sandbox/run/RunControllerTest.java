@@ -31,6 +31,7 @@ class RunControllerTest {
 
   @Autowired MockMvc mvc;
   @MockitoBean SandboxRunService sandboxRunService;
+  @MockitoBean SandboxReleaseFaultRegistry releaseFaults;
 
   @Test
   void unauthenticatedRequestReturns401() throws Exception {
@@ -49,7 +50,7 @@ class RunControllerTest {
       delivery.log("Hello, World!");
       delivery.complete();
       return new AcceptedSandboxRun(71L);
-    }).when(sandboxRunService).start(anyLong(), any(), any());
+    }).when(sandboxRunService).start(anyLong(), any(), any(), any());
 
     var result = mvc.perform(post("/sandbox/run")
             .with(jwt().jwt(j -> j.subject("42")))
@@ -76,7 +77,7 @@ class RunControllerTest {
             .content("{\"code\":\"print(1)\",\"language\":\"PYTHON\"}"))
         .andExpect(status().isServiceUnavailable());
 
-    verify(sandboxRunService, never()).start(anyLong(), any(), any());
+    verify(sandboxRunService, never()).start(anyLong(), any(), any(), any());
     var order = inOrder(sandboxRunService);
     order.verify(sandboxRunService).assertCanAdmit(42L);
     order.verify(sandboxRunService).isRunnerAvailable();
@@ -94,7 +95,7 @@ class RunControllerTest {
         .andExpect(status().isTooManyRequests());
 
     verify(sandboxRunService, never()).isRunnerAvailable();
-    verify(sandboxRunService, never()).start(anyLong(), any(), any());
+    verify(sandboxRunService, never()).start(anyLong(), any(), any(), any());
   }
 
   @Test
@@ -110,7 +111,7 @@ class RunControllerTest {
         .andExpect(status().isServiceUnavailable());
 
     verify(sandboxRunService, never()).isRunnerAvailable();
-    verify(sandboxRunService, never()).start(anyLong(), any(), any());
+    verify(sandboxRunService, never()).start(anyLong(), any(), any(), any());
   }
 
   @Test
@@ -140,7 +141,33 @@ class RunControllerTest {
             .content("{\"code\":\"   \",\"language\":\"PYTHON\"}"))
         .andExpect(status().isBadRequest());
 
-    verify(sandboxRunService, never()).start(anyLong(), any(), any());
+    verify(sandboxRunService, never()).start(anyLong(), any(), any(), any());
+  }
+
+  @Test
+  void candidateAndRunHeadersSelectExactlyOneReleaseFaultPlan() throws Exception {
+    when(sandboxRunService.isRunnerAvailable()).thenReturn(true);
+    SandboxReleaseFaultPlan plan = org.mockito.Mockito.mock(SandboxReleaseFaultPlan.class);
+    when(releaseFaults.consumeForRun("a".repeat(64), "R".repeat(43))).thenReturn(plan);
+    doAnswer(inv -> {
+      SandboxRunDelivery delivery = inv.getArgument(2);
+      delivery.session(73L);
+      delivery.complete();
+      return new AcceptedSandboxRun(73L);
+    }).when(sandboxRunService).start(anyLong(), any(), any(), any());
+
+    var result = mvc.perform(post("/sandbox/run")
+            .with(jwt().jwt(j -> j.subject("42")))
+            .header("X-Candidate-Spec-Sha256", "a".repeat(64))
+            .header("X-Release-Run-Key", "R".repeat(43))
+            .contentType(MediaType.APPLICATION_JSON)
+            .content("{\"code\":\"print(1)\",\"language\":\"PYTHON\"}"))
+        .andExpect(request().asyncStarted())
+        .andReturn();
+    mvc.perform(asyncDispatch(result)).andExpect(status().isOk());
+
+    verify(releaseFaults).consumeForRun("a".repeat(64), "R".repeat(43));
+    verify(sandboxRunService).start(anyLong(), any(), any(), org.mockito.ArgumentMatchers.same(plan));
   }
 
   @Test
@@ -157,6 +184,6 @@ class RunControllerTest {
           .andExpect(status().isBadRequest());
     }
 
-    verify(sandboxRunService, never()).start(anyLong(), any(), any());
+    verify(sandboxRunService, never()).start(anyLong(), any(), any(), any());
   }
 }

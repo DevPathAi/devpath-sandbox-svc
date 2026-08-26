@@ -1,10 +1,15 @@
 package ai.devpath.sandbox.run;
 
 import java.util.EnumSet;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 
 /** One-shot, run-bound staging fault plan. The disabled singleton is inert. */
 public final class SandboxReleaseFaultPlan {
+  private static final long IMMEDIATE_DISCONNECT_DELAY_MILLIS = 100;
+
   enum Fault {
     IMMEDIATE_DISCONNECT,
     MIDSTREAM_DISCONNECT,
@@ -30,6 +35,13 @@ public final class SandboxReleaseFaultPlan {
   }
 
   public SandboxRunDelivery wrap(SandboxRunDelivery delegate) {
+    return wrap(delegate, task -> CompletableFuture.delayedExecutor(
+        IMMEDIATE_DISCONNECT_DELAY_MILLIS, TimeUnit.MILLISECONDS).execute(task));
+  }
+
+  SandboxRunDelivery wrap(
+      SandboxRunDelivery delegate,
+      Consumer<Runnable> disconnectScheduler) {
     if (!active()) return delegate;
     AtomicBoolean disconnected = new AtomicBoolean();
     return new SandboxRunDelivery() {
@@ -39,7 +51,7 @@ public final class SandboxReleaseFaultPlan {
         delegate.session(sessionId);
         if (faults.contains(Fault.IMMEDIATE_DISCONNECT)
             && disconnected.compareAndSet(false, true)) {
-          delegate.complete();
+          disconnectScheduler.accept(delegate::complete);
         }
       }
 

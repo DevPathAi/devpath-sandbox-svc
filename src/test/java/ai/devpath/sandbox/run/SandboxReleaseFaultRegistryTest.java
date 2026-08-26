@@ -33,9 +33,13 @@ class SandboxReleaseFaultRegistryTest {
 
     SandboxReleaseFaultPlan plan = registry.consumeForRun(CANDIDATE, RUN_KEY);
     RecordingDelivery delegate = new RecordingDelivery();
-    SandboxRunDelivery delivery = plan.wrap(delegate);
+    List<Runnable> deferredDisconnect = new ArrayList<>();
+    SandboxRunDelivery delivery = plan.wrap(delegate, deferredDisconnect::add);
     delivery.session(71L);
 
+    assertThat(delegate.events).containsExactly("session:71");
+    assertThat(deferredDisconnect).hasSize(1);
+    deferredDisconnect.getFirst().run();
     assertThat(delegate.events).containsExactly("session:71", "complete");
     RunResult result = plan.apply(new RunResult(0, "ok", "", 1L, 2));
     assertThat(result.terminalStatus()).isEqualTo(SandboxTerminalStatus.TIMED_OUT);

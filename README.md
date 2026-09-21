@@ -62,3 +62,7 @@ full-session 계약이므로 응답을 축소하지 않습니다.
 
 - Git 규칙: [documents/09_Git_규칙_정의서](https://github.com/DevPathAi/documents/blob/main/09_Git_규칙_정의서.md)
 - 워크플로우 현황: `docs/project-management/` → [workflow-dashboard](https://devpathai.github.io/workflow-dashboard/)
+
+## 릴리스 증거 재빌드 기록
+
+- 2026-09-21: `main` push CI 가 만드는 immutable-image 증거 아티팩트는 30일 뒤 만료되고, 릴리스 승격(promote)은 만료되지 않은 증거를 요구한다. 증거 만료(임박)에 따라 코드 변경 없이 재빌드했다.

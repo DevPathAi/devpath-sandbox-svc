@@ -1,6 +1,6 @@
 # devpath-sandbox-svc
 
-**DevPath AI** Sandbox Runner — 사용자 코드를 격리 실행하는 서비스입니다.
+**레바(Leva)** Sandbox Runner — 사용자 코드를 격리 실행하는 서비스입니다.
 
 ## 담당 도메인
 
